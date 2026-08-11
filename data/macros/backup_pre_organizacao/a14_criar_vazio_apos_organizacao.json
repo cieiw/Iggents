@@ -1,0 +1,24 @@
+{
+  "screen": [
+    1080,
+    2408
+  ],
+  "device": {
+    "serial": "RQCW309LXKL",
+    "model": "a14",
+    "screen": [
+      1080,
+      2408
+    ],
+    "raw_size": [
+      "1081",
+      "2409"
+    ]
+  },
+  "groups": [
+    {
+      "name": "Grupo 1",
+      "actions": []
+    }
+  ]
+}

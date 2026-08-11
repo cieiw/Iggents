@@ -1,0 +1,5 @@
+# Backend recomendado para a etapa "Capturar código Whisper"
+faster-whisper>=1.1.0
+
+# Alternativa compatível com os mesmos modelos (instale apenas se preferir):
+# openai-whisper>=20240930

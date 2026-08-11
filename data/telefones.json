@@ -1,0 +1,79 @@
+{
+  "RQCW309LXKL": {
+    "name": "SPAM 1",
+    "model": "a14",
+    "model_criar": "a14",
+    "model_aquecer": "a14",
+    "model_treinar": "a14",
+    "models_by_panel": {
+      "postar": "a14",
+      "criar": "a14"
+    },
+    "active": true,
+    "keep_screen_on": true,
+    "active_panel": "criar"
+  },
+  "RX8W802BNVL": {
+    "name": "a14 (2)",
+    "model": "a14",
+    "model_criar": "",
+    "model_aquecer": "a14",
+    "model_treinar": "a14",
+    "models_by_panel": {},
+    "active": false,
+    "keep_screen_on": false
+  },
+  "f4973a8f0601": {
+    "name": "",
+    "models_by_panel": {
+      "criar": "Redmi 10",
+      "contas_normais": "Redmi 11",
+      "postar": "Redmi 10"
+    },
+    "model_criar": "",
+    "model_aquecer": "",
+    "model_treinar": "",
+    "active": true,
+    "model": "Redmi 10",
+    "keep_screen_on": true,
+    "active_panel": "postar"
+  },
+  "79d0f0a8": {
+    "name": "",
+    "models_by_panel": {
+      "integrar_sistema": "redmi 11",
+      "confirmar": "redmi 11"
+    },
+    "model_criar": "",
+    "model_aquecer": "",
+    "model_treinar": "",
+    "active": false,
+    "keep_screen_on": false
+  },
+  "D6RSHUVC8DYXJZ7P": {
+    "name": "",
+    "models_by_panel": {
+      "postar": "Redmi 14c"
+    },
+    "model": "Redmi 14c",
+    "active": true,
+    "model_criar": "Redmi 14c",
+    "model_aquecer": "Redmi 14c",
+    "model_treinar": "Redmi 14c",
+    "keep_screen_on": true,
+    "active_panel": "postar"
+  },
+  "RX8X7053LHK": {
+    "name": "",
+    "models_by_panel": {
+      "postar": "A15"
+    },
+    "model": "A15",
+    "active": true,
+    "model_criar": "A15",
+    "model_aquecer": "A15",
+    "model_treinar": "A15",
+    "keep_screen_on": true,
+    "active_panel": "postar"
+  }
+}

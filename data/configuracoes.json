@@ -1,0 +1,69 @@
+{
+  "delay_jitter": "20",
+  "position_jitter": "5",
+  "speed_jitter": "30",
+  "minimum_delay": "400",
+  "start_delay_max": "",
+  "show_touches": true,
+  "variations_enabled": true,
+  "smspool_api_key": "6EjOOH3HGuhB3K4GFQeilnqWcpMAm8bJ",
+  "panels": [
+    {
+      "id": "postar",
+      "name": "Normal"
+    },
+    {
+      "id": "criar",
+      "name": "Criar"
+    }
+  ],
+  "navigate_r_defaults": {
+    "min_s": "140.0",
+    "max_s": "300.0",
+    "pause_min": "4000",
+    "pause_max": "22000",
+    "swipe_min": "320",
+    "swipe_max": "620",
+    "double_min": "80",
+    "double_max": "150",
+    "double_chance": "30",
+    "position": "8",
+    "xml_queries": [
+      "Sugestões",
+      "Anúncio",
+      "Patrocinado"
+    ]
+  },
+  "navigate_s_defaults": {
+    "verify_timeout": "10",
+    "min_s": "30.0",
+    "max_s": "100.0",
+    "pause_min": "700",
+    "pause_max": "4000",
+    "tap_interval_min": "700",
+    "tap_interval_max": "1500",
+    "first_chance": "100.0",
+    "position": "4"
+  },
+  "end_position_jitter": "5",
+  "media_processor_script": "C:\\Users\\cieiw\\Desktop\\• scripts\\• clean\\• cleanM.py",
+  "number_apis": [
+    {
+      "id": "smspool",
+      "name": "SMSPool",
+      "script": "smspool.py",
+      "api_key": "6EjOOH3HGuhB3K4GFQeilnqWcpMAm8bJ"
+    },
+    {
+      "id": "5sim",
+      "name": "5sim.net",
+      "script": "5sim.py",
+      "api_key": "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE4MTc4MzU4NjQsImlhdCI6MTc4NjI5OTg2NCwicmF5IjoiYzYyYmI2MDAzYjhlMjYwMTdhODNlYTQ5NDVlMTE1YTkiLCJzdWIiOjQ0MTcyOTl9.E1cOX2d9U_UZYqM4x5c1gcThFl3W8G9TE3N2UHAJ987YkH-QmkFrYsVkEEDBnOxe8Fa7OW0DnitaBqe91EESIHKP4kMl-BmhIVTDh8VfuBJgl213WL4IKzXkh65vVKASycyFUAaWLjGT6EcAF8gXjxPyNq3wg8VwFrBqvXxIOANRcgnOCVcjsiv4TnVhpMzwVizNGlQDzXqNCqG5O7N9g7PIxY6K08nnBchn3VhqOJeMlqxl8TotAEyYSsRdFDYXdnfwK-v5l8sFgrCk3TXQ7U0KXrBUnrJaoqdIsrbY11032PfMjCpPstXCZqUg0ryt5TQLFRyWlHAHfue30EWc8Q"
+    }
+  ],
+  "default_number_api": "5sim",
+  "last_selected_device_by_panel": {
+    "postar": "RX8X7053LHK",
+    "criar": "RQCW309LXKL"
+  }
+}

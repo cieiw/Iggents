@@ -1,0 +1,28 @@
+{
+  "version_format": 2,
+  "number": 2,
+  "label": "postar",
+  "panel": "postar",
+  "model": "Redmi 14c",
+  "updated_at": "2026-08-01T21:28:14",
+  "macro": {
+    "screen": [
+      1080,
+      2340
+    ],
+    "device": {
+      "serial": "D6RSHUVC8DYXJZ7P",
+      "model": "Redmi 14c",
+      "screen": [
+        1080,
+        2340
+      ],
+      "raw_size": [
+        "1080",
+        "1920"
+      ]
+    },
+    "groups": [],
+    "active_version": 2
+  }
+}

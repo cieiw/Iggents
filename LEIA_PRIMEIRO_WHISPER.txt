@@ -1,0 +1,12 @@
+ATUALIZAÇÃO WHISPER
+
+O código atualizado está em app.py e tools/.
+Para testar diretamente, execute iggents.pyw com Python e instale as dependências
+listadas em requirements-whisper.txt.
+
+A pasta artifacts/ veio do ZIP original e contém uma compilação anterior.
+Ela foi mantida apenas como histórico e o iggents.exe antigo não contém as novas
+etapas. Para criar um executável novo no Windows, execute build_windows.bat.
+
+Também é necessário instalar FFmpeg no PATH ou colocar ffmpeg.exe em:
+tools\ffmpeg\ffmpeg.exe

@@ -1,0 +1,40 @@
+{
+  "NORMAL_ACCOUNT_VIDEO_NEXT_INDEX": 4,
+  "NORMAL_ACCOUNT_LAST_SENT_FILE": "E:\\• hot\\• modelos\\# 5 helen\\social\\fotos\\f (4).JPG",
+  "NORMAL_ACCOUNT_PHOTO_NEXT_INDEX": 8,
+  "NAV_RC_TEXT": "",
+  "RANDOM_CAPTION": "Alguém confirma? 👀",
+  "RANDOM_HASHTAGS": "#trendando",
+  "LINK_TITLE": "Vem comigo 🤭😏",
+  "SCHEDULE_DIVISIONS": {
+    "e537dc13711b4b5cb4275c6bc369697b": {
+      "nome": "Manhã",
+      "intervalo": "09:00–12:00",
+      "sorteado_em": "2026-08-08T13:56:26-03:00",
+      "liberado_em": 1786280615.141105,
+      "horario_sorteado": "09/08 10:03"
+    },
+    "64dd95720ab943e19ef5afe54b9bb792": {
+      "nome": "tarde",
+      "intervalo": "13:00–16:00",
+      "sorteado_em": "2026-08-08T14:14:20-03:00",
+      "liberado_em": 1786214935.897447,
+      "horario_sorteado": "08/08 15:48"
+    },
+    "f7932eafdaa7464592c8b48ab734cb2d": {
+      "nome": "manha",
+      "intervalo": "09:00–12:00",
+      "sorteado_em": "2026-08-08T14:16:49-03:00",
+      "liberado_em": 1786277583.794816,
+      "horario_sorteado": "09/08 09:13"
+    },
+    "ccf52c6e511f4bfaa03a28e9360670b5": {
+      "nome": "tarde",
+      "intervalo": "14:20–14:25",
+      "sorteado_em": "2026-08-08T14:17:23-03:00",
+      "liberado_em": 1786209757.279808,
+      "horario_sorteado": "08/08 14:22"
+    }
+  },
+  "RANDOM_USER_LINK": "https://helenfreitasprivs.vercel.app"
+}

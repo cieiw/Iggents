@@ -1,0 +1,80 @@
+{
+  "screen": [
+    1080,
+    2408
+  ],
+  "device": {
+    "serial": "RQCW309LXKL",
+    "model": "samsung SM-A146M",
+    "screen": [
+      1080,
+      2408
+    ],
+    "raw_size": [
+      "1081",
+      "2409"
+    ]
+  },
+  "actions": [
+    {
+      "kind": "swipe",
+      "x": 701,
+      "y": 1770,
+      "x2": 799,
+      "y2": 1111,
+      "duration_ms": 154,
+      "delay_ms": 0,
+      "keycode": null
+    },
+    {
+      "kind": "swipe",
+      "x": 459,
+      "y": 1111,
+      "x2": 459,
+      "y2": 943,
+      "duration_ms": 40,
+      "delay_ms": 903,
+      "keycode": null
+    },
+    {
+      "kind": "swipe",
+      "x": 859,
+      "y": 943,
+      "x2": 859,
+      "y2": 2404,
+      "duration_ms": 55,
+      "delay_ms": 1035,
+      "keycode": null
+    },
+    {
+      "kind": "tap",
+      "x": 829,
+      "y": 2404,
+      "x2": null,
+      "y2": null,
+      "duration_ms": 40,
+      "delay_ms": 1196,
+      "keycode": null
+    },
+    {
+      "kind": "swipe",
+      "x": 422,
+      "y": 2406,
+      "x2": 422,
+      "y2": 1695,
+      "duration_ms": 44,
+      "delay_ms": 654,
+      "keycode": null
+    },
+    {
+      "kind": "swipe",
+      "x": 831,
+      "y": 1695,
+      "x2": 831,
+      "y2": 2398,
+      "duration_ms": 40,
+      "delay_ms": 842,
+      "keycode": null
+    }
+  ]
+}
