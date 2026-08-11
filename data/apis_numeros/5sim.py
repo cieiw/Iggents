@@ -99,6 +99,20 @@ def wait_for_code(config: dict, order_id: str, timeout_s: int, cancel_event=None
     raise RuntimeError(f"nenhum SMS recebido em {timeout_s}s" + (f" (estado: {last_status})" if last_status else ""))
 
 
+def check_code(config: dict, order_id: str) -> str:
+    """Consulta uma única vez o pedido atual, sem aguardar SMS."""
+    result = _request(config, f"/check/{quote(str(order_id), safe='')}")
+    messages = result.get("sms")
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if isinstance(message, dict) and str(message.get("code") or "").strip():
+                return str(message["code"]).strip()
+    status = str(result.get("status") or "").upper()
+    if status in {"CANCELED", "CANCELLED", "FINISHED", "TIMEOUT", "EXPIRED"}:
+        raise RuntimeError(f"pedido {order_id} encerrado pela 5sim ({status})")
+    return ""
+
+
 def finish_order(config: dict, order_id: str) -> None:
     """Marca o pedido como concluído depois de o código ser digitado."""
     _request(config, f"/finish/{quote(str(order_id), safe='')}")

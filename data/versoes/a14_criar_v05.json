@@ -4,7 +4,7 @@
   "label": "",
   "panel": "criar",
   "model": "a14",
-  "updated_at": "2026-08-10T20:00:52",
+  "updated_at": "2026-08-11T14:38:32",
   "macro": {
     "screen": [
       1080,
@@ -93,6 +93,7 @@
             "fallback_group": null,
             "branch_actions": null,
             "loop_restart_actions": null,
+            "restart_parent_actions": null,
             "xml_any_max_rounds": 1,
             "nav_min_s": 12.0,
             "nav_max_s": 20.0,
@@ -205,6 +206,7 @@
             "fallback_group": null,
             "branch_actions": null,
             "loop_restart_actions": null,
+            "restart_parent_actions": null,
             "xml_any_max_rounds": 1,
             "nav_min_s": 12.0,
             "nav_max_s": 20.0,
@@ -317,6 +319,7 @@
             "fallback_group": null,
             "branch_actions": null,
             "loop_restart_actions": null,
+            "restart_parent_actions": null,
             "xml_any_max_rounds": 1,
             "nav_min_s": 12.0,
             "nav_max_s": 20.0,
@@ -365,7 +368,7 @@
           }
         ]
       }
-    ]
-  },
-  "created_at": "2026-08-10T20:00:52"
+    ],
+    "active_version": 5
+  }
 }

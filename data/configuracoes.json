@@ -3,8 +3,8 @@
   "position_jitter": "5",
   "speed_jitter": "30",
   "minimum_delay": "400",
-  "start_delay_max": "",
-  "show_touches": true,
+  "start_delay_max": "20",
+  "show_touches": false,
   "variations_enabled": true,
   "smspool_api_key": "6EjOOH3HGuhB3K4GFQeilnqWcpMAm8bJ",
   "panels": [
@@ -63,7 +63,9 @@
   ],
   "default_number_api": "5sim",
   "last_selected_device_by_panel": {
-    "postar": "RX8X7053LHK",
-    "criar": "RQCW309LXKL"
-  }
+    "postar": "f4973a8f0601",
+    "criar": "RX8X7053LHK"
+  },
+  "delay_jitter_down": "100",
+  "delay_jitter_up": "6000"
 }

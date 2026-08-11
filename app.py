@@ -103,6 +103,7 @@ DEFAULT_PANELS = (
 # Processos iniciados a partir do Python sem console (principalmente ADB) não
 # devem criar janelas de comando breves na frente do iggents.
 NO_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+ADB_PROCESS_CONTEXT = threading.local()
 
 
 @dataclass
@@ -112,6 +113,20 @@ class PanelRun:
     stop_event: threading.Event = field(default_factory=threading.Event)
     total_steps: int = 0
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    active_processes: set[object] = field(default_factory=set, repr=False)
+    process_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def stop_now(self) -> None:
+        """Cancela ADBs em curso, além de sinalizar a lógica da execução."""
+        self.stop_event.set()
+        with self.process_lock:
+            processes = tuple(self.active_processes)
+        for process in processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except (AttributeError, OSError):
+                pass
 
 
 @dataclass(frozen=True)
@@ -183,6 +198,9 @@ class Action:
     selector_value: str | None = None
     # Texto que invalida um candidato XML, mesmo quando a busca principal bate.
     selector_blocked_text: str | None = None
+    # Toque opcional usado somente se a leitura do XML estiver indisponível.
+    xml_unavailable_tap_x: int | None = None
+    xml_unavailable_tap_y: int | None = None
     match_mode: str = "exact"
     timeout_s: int = 10
     label: str | None = None
@@ -193,7 +211,17 @@ class Action:
     app_open_confirm_s: int = 8
     email_domain: str | None = None
     enabled: bool = True
+    # Usado apenas ao reproduzir uma etapa isoladamente pelo atalho/botão.
+    run_immediately: bool = False
     use_variation: bool = False
+    # Limites independentes da pausa, em milissegundos. O campo antigo
+    # continua sendo lido para compatibilidade com macros já gravadas.
+    delay_variation_min_ms: float | None = None
+    delay_variation_max_ms: float | None = None
+    # Campos que chegaram a ser gravados por uma versão intermediária. São
+    # mantidos somente para abrir essas macros sem perder nenhuma etapa.
+    delay_variation_min_pct: float | None = None
+    delay_variation_max_pct: float | None = None
     delay_variation_pct: float | None = None
     position_variation_px: int | None = None
     end_position_variation_px: int | None = None
@@ -256,6 +284,9 @@ class Action:
     # começar na etapa selecionada para depuração. Ao encontrar a condição de
     # reinício, porém, esta lista contém o grupo completo a ser reiniciado.
     loop_restart_actions: list[dict] | None = None
+    # Lista exata de etapas do contêiner pai de "Código não chegou".
+    # É metadado de execução, montado ao achatar subgrupos.
+    restart_parent_actions: list[dict] | None = None
     # Controlador XML que toca qualquer candidato: número máximo de ciclos.
     xml_any_max_rounds: int = 1
     nav_min_s: float = 12.0
@@ -323,13 +354,28 @@ class Adb:
         base = [self.path]
         if self.serial:
             base += ["-s", self.serial]
-        run = subprocess.run(base + list(args), capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=timeout,
-                             creationflags=NO_CONSOLE)
-        if run.returncode:
-            detail = run.stderr.strip() or run.stdout.strip() or "sem detalhe retornado pelo aparelho"
+        panel_run = getattr(ADB_PROCESS_CONTEXT, "run", None)
+        if panel_run and panel_run.stop_event.is_set():
+            raise InterruptedError("Execução interrompida")
+        process = subprocess.Popen(base + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   encoding="utf-8", errors="replace", creationflags=NO_CONSOLE)
+        if panel_run:
+            with panel_run.process_lock:
+                panel_run.active_processes.add(process)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise
+        finally:
+            if panel_run:
+                with panel_run.process_lock:
+                    panel_run.active_processes.discard(process)
+        if process.returncode:
+            detail = stderr.strip() or stdout.strip() or "sem detalhe retornado pelo aparelho"
             raise RuntimeError(f"ADB falhou em {' '.join(args[:3])}: {detail}")
-        return run.stdout
+        return stdout
 
     def devices(self) -> list[tuple[str, str]]:
         # `adb devices` precisa funcionar mesmo se o último aparelho escolhido
@@ -872,6 +918,7 @@ class MacroApp(tk.Tk):
         # Estado de borda para o Esc global do Windows. Assim manter a tecla
         # pressionada não dispara várias paradas seguidas.
         self._global_escape_was_down = False
+        self.pc_automation_escape_target: tuple[str, str] | None = None
         self.execution_refresh_pending = False
         # Cada pedido de execução recebe um número. Assim uma atualização de
         # aparelhos que terminou atrasada nunca inicia uma execução já cancelada.
@@ -896,9 +943,10 @@ class MacroApp(tk.Tk):
         self.live_view_session = 0
         self.live_view_edit_mode = False
         self._live_edit_mouse_down = False
-        self._live_ctrl_record_start: tuple[int, int, float] | None = None
+        self._live_ctrl_record_start: tuple[int, int, float, int] | None = None
         self._live_ctrl_record_mouse_down = False
         self._live_ctrl_record_previous_end: float | None = None
+        self._live_ctrl_held_since: float | None = None
         # Pedido temporário do diálogo XML para escolher um nó diretamente
         # pela tela ao vivo: serial, elementos e retorno para o diálogo.
         self.live_xml_picker: dict | None = None
@@ -918,6 +966,7 @@ class MacroApp(tk.Tk):
         self.device_grid_card_widgets: dict[str, tk.Frame] = {}
         self.device_grid_title_details: dict[str, tk.Label] = {}
         self.device_grid_flow_trees: dict[str, ttk.Treeview] = {}
+        self.grid_focused_panel = ""
         # Na grade de celulares cada telefone pode abrir seu próprio resumo de
         # fluxo. O estado é separado da tela principal para a grade continuar
         # naturalmente minimizada ao entrar nela.
@@ -935,9 +984,12 @@ class MacroApp(tk.Tk):
         self.grid_xml_marker_bounds: dict[str, tuple[tuple[int, int, int, int], tuple[int, int]]] = {}
         self.grid_xml_picker: dict | None = None
         self.grid_xml_inspection_serial = ""
-        self.grid_ctrl_record_starts: dict[str, tuple[int, int, float]] = {}
+        self.grid_ctrl_record_starts: dict[str, tuple[int, int, float, int]] = {}
+        self.grid_ctrl_held_since: dict[str, float] = {}
         self.grid_modified_pointer_serials: set[str] = set()
         self.grid_edit_mouse_down = False
+        self.grid_alt_armed_serial = ""
+        self.grid_alt_armed_at = 0.0
         self.grid_scrcpy_original_exstyles: dict[str, int] = {}
         self.grid_capture_stop = threading.Event()
         self.grid_view_session = 0
@@ -991,8 +1043,14 @@ class MacroApp(tk.Tk):
 
     def on_close(self) -> None:
         """Restaura o comportamento de tela dos aparelhos usados pelo app."""
+        for active_run in tuple(self.panel_runs.values()):
+            active_run.stop_now()
         self.stop_live_view()
         self._stop_grid_live_views()
+        # ``terminate`` é assíncrono e alguns scrcpy demoravam a fechar no
+        # instante em que o Tk era destruído. Antes de sair, elimine e aguarde
+        # toda a árvore de visualizações iniciada por esta instância.
+        self._close_orphaned_scrcpy_views(wait=True)
         for serial in tuple(self.awake_serials):
             try:
                 adb = Adb()
@@ -1107,6 +1165,14 @@ class MacroApp(tk.Tk):
         if key in self._grid_popups_hiding_live_views:
             return
         self._grid_popups_hiding_live_views.add(key)
+        # A tela pode ficar visível provisoriamente apenas enquanto se inspeciona
+        # um XML. Ao abrir qualquer outro popup (por exemplo, editar espera),
+        # esse modo termina para nenhuma tela nativa cobrir o diálogo.
+        inspected = str(self.grid_xml_inspection_serial or "")
+        self.grid_xml_inspection_serial = ""
+        if inspected:
+            self.grid_xml_marker_bounds.pop(inspected, None)
+            self._hide_grid_marker(inspected)
         self._hide_grid_markers()
         try:
             user32 = ctypes.windll.user32
@@ -1497,6 +1563,19 @@ class MacroApp(tk.Tk):
     def _scroll_main_content(self, event) -> None:
         """Rola a página; a lista lateral só segura o scroll enquanto couber."""
         x, y = self.winfo_pointerx(), self.winfo_pointery()
+        # Em Celulares, a roda sobre a lista compacta percorre somente suas
+        # tarefas; a página geral não pode deslocar essa área de trabalho.
+        for compact in tuple(getattr(self, "device_grid_flow_trees", {}).values()):
+            try:
+                if (compact.winfo_exists()
+                        and compact.winfo_rootx() <= x <= compact.winfo_rootx() + compact.winfo_width()
+                        and compact.winfo_rooty() <= y <= compact.winfo_rooty() + compact.winfo_height()):
+                    step = -int(event.delta / 120)
+                    if step:
+                        compact.yview_scroll(step, "units")
+                    return "break"
+            except tk.TclError:
+                continue
         action_canvas = getattr(self, "action_buttons_canvas", None)
         if action_canvas and action_canvas.winfo_rootx() <= x <= action_canvas.winfo_rootx() + action_canvas.winfo_width() and action_canvas.winfo_rooty() <= y <= action_canvas.winfo_rooty() + action_canvas.winfo_height():
             step = -int(event.delta / 120)
@@ -1631,7 +1710,9 @@ class MacroApp(tk.Tk):
         self.recording_choice = tk.StringVar()
         self.raw_x_var = tk.StringVar(value="1080")
         self.raw_y_var = tk.StringVar(value="1920")
-        self.delay_jitter = tk.StringVar(value=str(self.settings.get("delay_jitter", "20")))
+        legacy_delay_jitter = str(self.settings.get("delay_jitter", "20"))
+        self.delay_jitter_down = tk.StringVar(value=str(self.settings.get("delay_jitter_down", legacy_delay_jitter)))
+        self.delay_jitter_up = tk.StringVar(value=str(self.settings.get("delay_jitter_up", legacy_delay_jitter)))
         self.position_jitter = tk.StringVar(value=str(self.settings.get("position_jitter", "0")))
         self.end_position_jitter = tk.StringVar(value=str(self.settings.get("end_position_jitter", self.settings.get("position_jitter", "0"))))
         self.speed_jitter = tk.StringVar(value=str(self.settings.get("speed_jitter", "15")))
@@ -1657,7 +1738,7 @@ class MacroApp(tk.Tk):
         self.log_text: tk.Text | None = None
         self.inline_log_text: tk.Text | None = None
         self._last_logged_status = ""
-        for variable in (self.delay_jitter, self.position_jitter, self.end_position_jitter, self.speed_jitter, self.minimum_delay, self.start_delay_max, self.show_touches_var, self.variations_enabled):
+        for variable in (self.delay_jitter_down, self.delay_jitter_up, self.position_jitter, self.end_position_jitter, self.speed_jitter, self.minimum_delay, self.start_delay_max, self.show_touches_var, self.variations_enabled):
             variable.trace_add("write", self._save_settings)
         self.variations_enabled.trace_add("write", self._update_variation_controls)
         self.action_search_var.trace_add("write", self._filter_action_buttons)
@@ -1798,12 +1879,14 @@ class MacroApp(tk.Tk):
                       fg_color="#2f6fed", hover_color="#4b82ee").grid(row=0, column=2, padx=(0, 8))
         ctk.CTkButton(action_row, text="Executar daqui", command=self.run_from_selection, width=122, height=30, corner_radius=9,
                       fg_color="#39455b", hover_color="#4a5870").grid(row=0, column=3, padx=(0, 14))
+        ctk.CTkButton(action_row, text="Reproduzir etapa", command=self.run_selected_action, width=126, height=30, corner_radius=9,
+                      fg_color="#39455b", hover_color="#4a5870").grid(row=0, column=4, padx=(0, 14))
         ctk.CTkCheckBox(action_row, text="Mostrar pontos/traços", variable=self.show_touches_var, width=170, height=30,
-                         checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color="#2f6fed",
-                         hover_color="#4b82ee", text_color="#dbe5f2", command=self.apply_touch_overlay).grid(row=0, column=4, padx=(0, 20), sticky="w")
-        ttk.Label(action_row, text="Início aleatório até (s):").grid(row=0, column=5, padx=(0, 5), sticky="e")
+                      checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color="#2f6fed",
+                         hover_color="#4b82ee", text_color="#dbe5f2", command=self.apply_touch_overlay).grid(row=0, column=5, padx=(0, 20), sticky="w")
+        ttk.Label(action_row, text="Início aleatório até (s):").grid(row=0, column=6, padx=(0, 5), sticky="e")
         ctk.CTkEntry(action_row, textvariable=self.start_delay_max, width=62, height=30, corner_radius=8,
-                     fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=6, sticky="w")
+                     fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=7, sticky="w")
 
         version_row = tk.Frame(controls, bg="#11141a")
         version_row.grid(row=1, column=0, pady=(7, 0), sticky="ew")
@@ -1828,37 +1911,41 @@ class MacroApp(tk.Tk):
         # Duas linhas de campos e uma linha de controles. Assim o ajuste do
         # fim do arrasto permanece visível mesmo no painel compacto.
         random_box.grid_columnconfigure(0, minsize=136)
-        random_box.grid_columnconfigure(1, minsize=60)
-        random_box.grid_columnconfigure(2, minsize=176)
-        random_box.grid_columnconfigure(3, minsize=62)
-        random_box.grid_columnconfigure(4, minsize=92)
-        random_box.grid_columnconfigure(5, minsize=58)
-        ttk.Label(random_box, text="Pausa ± %:").grid(row=0, column=0, sticky="w")
-        self.delay_jitter_entry = ctk.CTkEntry(random_box, textvariable=self.delay_jitter, width=54, height=30, corner_radius=8,
+        random_box.grid_columnconfigure(1, minsize=54)
+        random_box.grid_columnconfigure(2, minsize=54)
+        random_box.grid_columnconfigure(3, minsize=176)
+        random_box.grid_columnconfigure(4, minsize=62)
+        random_box.grid_columnconfigure(5, minsize=92)
+        random_box.grid_columnconfigure(6, minsize=58)
+        ttk.Label(random_box, text="Pausa - / + (ms):").grid(row=0, column=0, sticky="w")
+        self.delay_jitter_down_entry = ctk.CTkEntry(random_box, textvariable=self.delay_jitter_down, width=50, height=30, corner_radius=8,
                                                 fg_color="#222938", border_color="#465166", text_color="#f8fafc")
-        self.delay_jitter_entry.grid(row=0, column=1, padx=(4, 18))
-        ttk.Label(random_box, text="Espera mínima por etapa (ms):").grid(row=0, column=2, sticky="w")
+        self.delay_jitter_down_entry.grid(row=0, column=1, padx=(4, 3))
+        self.delay_jitter_up_entry = ctk.CTkEntry(random_box, textvariable=self.delay_jitter_up, width=50, height=30, corner_radius=8,
+                                                   fg_color="#222938", border_color="#465166", text_color="#f8fafc")
+        self.delay_jitter_up_entry.grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(random_box, text="Espera mínima por etapa (ms):").grid(row=0, column=3, sticky="w")
         ctk.CTkEntry(random_box, textvariable=self.minimum_delay, width=62, height=30, corner_radius=8,
-                     fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=3, padx=(4, 18))
-        ttk.Label(random_box, text="Fim arrasto ± px:").grid(row=0, column=4, sticky="w")
+                     fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=4, padx=(4, 18))
+        ttk.Label(random_box, text="Fim arrasto ± px:").grid(row=0, column=5, sticky="w")
         self.end_position_jitter_entry = ctk.CTkEntry(random_box, textvariable=self.end_position_jitter, width=54, height=30, corner_radius=8,
                                                        fg_color="#222938", border_color="#465166", text_color="#f8fafc")
-        self.end_position_jitter_entry.grid(row=0, column=5, padx=(4, 0), sticky="w")
+        self.end_position_jitter_entry.grid(row=0, column=6, padx=(4, 0), sticky="w")
         ttk.Label(random_box, text="Toque/início ± px:").grid(row=1, column=0, pady=(7, 0), sticky="w")
         self.position_jitter_entry = ctk.CTkEntry(random_box, textvariable=self.position_jitter, width=54, height=30, corner_radius=8,
                                                    fg_color="#222938", border_color="#465166", text_color="#f8fafc")
         self.position_jitter_entry.grid(row=1, column=1, padx=(4, 18), pady=(7, 0))
-        ttk.Label(random_box, text="Duração arrasto ± %:").grid(row=1, column=2, pady=(7, 0), sticky="w")
+        ttk.Label(random_box, text="Duração arrasto ± %:").grid(row=1, column=3, pady=(7, 0), sticky="w")
         self.speed_jitter_entry = ctk.CTkEntry(random_box, textvariable=self.speed_jitter, width=54, height=30, corner_radius=8,
                                                 fg_color="#222938", border_color="#465166", text_color="#f8fafc")
-        self.speed_jitter_entry.grid(row=1, column=3, padx=4, pady=(7, 0))
+        self.speed_jitter_entry.grid(row=1, column=4, padx=4, pady=(7, 0))
         ctk.CTkSwitch(random_box, text="Ativar variações: pausa, posição e duração do arrasto",
                       variable=self.variations_enabled, onvalue=True, offvalue=False,
                       command=self._update_variation_controls, width=330, height=28,
                       fg_color="#465166", progress_color="#2f6fed", button_color="#e7edf7").grid(row=2, column=0, columnspan=3, pady=(8, 0), sticky="w")
         ctk.CTkButton(random_box, text="Aplicar selecionadas", command=self.apply_variation_to_selected, width=150, height=30,
                       corner_radius=8, fg_color="#39455b", hover_color="#4a5870").grid(row=2, column=3, columnspan=2, padx=(12, 0), pady=(8, 0), sticky="w")
-        self.variation_entries = (self.delay_jitter_entry, self.position_jitter_entry, self.end_position_jitter_entry, self.speed_jitter_entry)
+        self.variation_entries = (self.delay_jitter_down_entry, self.delay_jitter_up_entry, self.position_jitter_entry, self.end_position_jitter_entry, self.speed_jitter_entry)
 
         # Área principal de edição: árvore, log, prévia e atalhos compartilham
         # uma altura ampla para não ficarem espremidos no rodapé.
@@ -1875,7 +1962,7 @@ class MacroApp(tk.Tk):
         ttk.Label(tree_search, text="Buscar no fluxo:").pack(side="left", padx=(0, 6))
         self.tree_search_entry = ctk.CTkEntry(
             tree_search, textvariable=self.tree_search_var,
-            placeholder_text="Nome, ação, XML ou texto da etapa...", height=28,
+            placeholder_text="Nome, ação ou XML — separe buscas por vírgula", height=28,
             corner_radius=7, fg_color="#222938", border_color="#465166", text_color="#f8fafc",
         )
         self.tree_search_entry.pack(side="left", fill="x", expand=True)
@@ -1904,6 +1991,7 @@ class MacroApp(tk.Tk):
         self.tree.bind("<F3>", lambda _event: self.toggle_enabled_selected())
         self.tree.bind("<F4>", self.shortcut_toggle_variation)
         self.tree.bind("<F5>", lambda _event: self.configure_selected_variation())
+        self.tree.bind("<F6>", self.shortcut_run_selected_action)
         self.tree.bind("<Control-e>", self.toggle_selected_tree_groups)
         self.tree.bind("<Control-a>", self.select_all_tree)
         self.tree.bind("<Control-c>", self.copy_selected)
@@ -1921,6 +2009,7 @@ class MacroApp(tk.Tk):
         self.tree.bind("<Alt-Down>", self.shortcut_execute_from_selection)
         self.tree.bind("<Control-Return>", self.configure_selected_from_shortcut)
         self.tree.bind("<Alt-Double-Button-1>", self.execute_from_tree_double_click)
+        self.tree.bind("<Shift-Double-Button-1>", self.execute_selected_tree_double_click)
         self.bind_all("<Escape>", self.escape_stop)
         self.bind_all("<Key-r>", self.shortcut_record)
         self.bind_all("<Key-g>", self.shortcut_new_group)
@@ -1928,6 +2017,7 @@ class MacroApp(tk.Tk):
         self.bind_all("<Control-Shift-F>", self.focus_tree_search)
         self.bind_all("<space>", self.shortcut_execute)
         self.bind_all("<Alt-Down>", self.shortcut_execute_from_selection)
+        self.bind_all("<F6>", self.shortcut_run_selected_action)
         log_panel = ttk.LabelFrame(middle, text="Log de execução", padding=(10, 6), width=430)
         log_panel.pack_propagate(False)
         log_controls = ttk.Frame(log_panel)
@@ -2249,6 +2339,19 @@ class MacroApp(tk.Tk):
             self.run_macro(refresh_first=False, run_all_panels=False, only_serial=serial,
                            target_panel=panel)
 
+    def run_all_devices_in_grid_panel(self, panel: str) -> None:
+        """Inicia todos os celulares ativos atribuídos ao painel indicado."""
+        if not panel or panel == "__unassigned__":
+            self.status.set("Atribua os celulares a um painel antes de executar.")
+            return
+        try:
+            maximum = max(0, float(self.start_delay_max.get().strip() or "0"))
+        except ValueError:
+            messagebox.showwarning("Início aleatório", "Informe um número válido de segundos.")
+            return
+        self.status.set(f"Iniciando todos os celulares de {self.panel_name(panel)}; início aleatório de até {maximum:g} s.")
+        self.run_macro(refresh_first=False, run_all_panels=False, target_panel=panel)
+
     def _grid_run_from_item(self, serial: str, panel: str, tree: ttk.Treeview) -> None:
         # A grade compacta usa exatamente o mesmo caminho da lista principal.
         # Isso preserva Nav-R/Nav-S, loops e subgrupos sem uma interpretacao
@@ -2280,6 +2383,12 @@ class MacroApp(tk.Tk):
                            start_nested_parent_index=path[0] if path else None,
                            start_nested_action_index=path[1] if len(path) > 1 else 0)
 
+    def _grid_run_selected_item(self, serial: str, panel: str, tree: ttk.Treeview) -> None:
+        if not self._grid_activate_tree_item(serial, panel, tree):
+            self.status.set("Selecione uma etapa no cartão do celular.")
+            return
+        self.run_selected_action(only_serial=serial)
+
     def _grid_activate_tree_item(self, serial: str, panel: str, tree: ttk.Treeview) -> bool:
         """Leva a seleção do cartão compacto para a árvore principal."""
         selected = tree.selection()
@@ -2306,6 +2415,9 @@ class MacroApp(tk.Tk):
         return True
 
     def _grid_tree_shortcut(self, serial: str, panel: str, tree: ttk.Treeview, command: str):
+        if command == "run_one":
+            self._grid_run_selected_item(serial, panel, tree)
+            return "break"
         if command == "run_from":
             self._grid_run_from_item(serial, panel, tree)
             return "break"
@@ -2366,10 +2478,10 @@ class MacroApp(tk.Tk):
         self._update_grid_touch_marker(serial, source_item)
 
     def _grid_edit_compact_tree_cell(self, serial: str, panel: str, tree: ttk.Treeview, event) -> None:
-        """Edita Inicio/Espera do cartão usando a mesma edição da árvore principal."""
+        """Edita início, duração e espera do cartão com um único clique."""
         compact_item = tree.identify_row(event.y)
         compact_column = tree.identify_column(event.x)
-        if not compact_item or compact_column not in ("#2", "#3"):
+        if not compact_item or compact_column not in ("#2", "#3", "#4"):
             return
         tree.selection_set(compact_item)
         tree.focus(compact_item)
@@ -2378,13 +2490,13 @@ class MacroApp(tk.Tk):
         source = getattr(tree, "grid_source_items", {}).get(compact_item, "")
         # A árvore principal fica fora da tela enquanto a grade está aberta.
         # Portanto a espera da versão compacta não pode depender do bbox dela.
-        if compact_column == "#3":
+        if compact_column == "#4":
             updated_delay = self._edit_grid_compact_delay(serial, panel, getattr(tree, "grid_fallback_model", ""), source)
             self._reload_compact_flow_tree(tree, serial, panel, getattr(tree, "grid_fallback_model", ""))
             if updated_delay is not None and tree.exists(compact_item):
                 tree.set(compact_item, "wait", f"{updated_delay} ms")
             return
-        main_column = "#2" if compact_column == "#2" else "#5"
+        main_column = "#2" if compact_column == "#2" else "#4"
         try:
             bbox = self.tree.bbox(source, main_column)
         except tk.TclError:
@@ -2550,6 +2662,13 @@ class MacroApp(tk.Tk):
                 return action.keycode or "tecla"
             return action.selector_value or action.text_value or "—"
 
+        def action_duration(action: Action) -> str:
+            if action.kind == "xml_tap":
+                return f"{action.timeout_s:g} s"
+            if action.kind == "swipe":
+                return f"{action.duration_ms} ms"
+            return "—"
+
         def draw_actions(parent_id: str, group_index: int, actions: list[Action], path_prefix: list[int]) -> None:
             for index, raw in enumerate(actions):
                 action = raw if isinstance(raw, Action) else Action(**raw)
@@ -2558,8 +2677,8 @@ class MacroApp(tk.Tk):
                 is_schedule_divider = action.kind in ("schedule_divider", "schedule_divider_end")
                 tree.insert(parent_id, "end", iid=item_id,
                             text=schedule_divider_text(action) if is_schedule_divider else (action.label or f"Etapa {index + 1}"),
-                            values=("", "", "") if is_schedule_divider else
-                            (labels.get(action.kind, action.kind), action_start(action), f"{action.delay_ms} ms"),
+                            values=("", "", "", "") if is_schedule_divider else
+                            (labels.get(action.kind, action.kind), action_start(action), action_duration(action), f"{action.delay_ms} ms"),
                             tags=("schedule_divider",) if is_schedule_divider else (), open=False)
                 item_kind = "action" if not path_prefix else "nested"
                 target = (item_kind, group_index, tuple(path))
@@ -2578,12 +2697,12 @@ class MacroApp(tk.Tk):
                     divider = Action(**divider)
                 if isinstance(divider, Action):
                     tree.insert("", "end", iid=group_id, text=schedule_divider_text(divider),
-                                values=("", "", ""), tags=("schedule_divider",), open=False)
+                                values=("", "", "", ""), tags=("schedule_divider",), open=False)
                     tree.grid_execution_items[group_id] = ("group", group_index, ())
                     tree.grid_source_items[group_id] = source_item("group", group_index, ())
                 continue
             tree.insert("", "end", iid=group_id, text=str(group.get("name") or f"Grupo {group_index + 1}"),
-                        values=(f"{len(group.get('actions') or [])} etapa(s)", "", ""), open=False)
+                        values=(f"{len(group.get('actions') or [])} etapa(s)", "", "", ""), open=False)
             tree.grid_execution_items[group_id] = ("group", group_index, ())
             tree.grid_source_items[group_id] = source_item("group", group_index, ())
             draw_actions(group_id, group_index, group.get("actions") or [], [])
@@ -2637,11 +2756,14 @@ class MacroApp(tk.Tk):
             ("■ Parar", "stop", "#a8394c"),
             ("▶ Executar", "run", "#6d35bb"),
             ("▶▶ Executar daqui", "run_from", "#39455b"),
+            ("▶ Etapa", "run_one", "#39455b"),
         )
         for text, action, color in controls:
             ctk.CTkButton(toolbar, text=text,
                           command=(lambda: self._grid_run_from_item(serial, panel, compact))
                           if action == "run_from"
+                          else (lambda: self._grid_run_selected_item(serial, panel, compact))
+                          if action == "run_one"
                           else (lambda value=action: self._grid_run_panel_action(serial, panel, value)),
                           width=108 if action == "run_from" else 82, height=28, corner_radius=7, fg_color=color,
                            hover_color="#8552c7" if action != "stop" else "#c34a5d").pack(side="left", padx=(0, 5))
@@ -2656,15 +2778,17 @@ class MacroApp(tk.Tk):
         # Reserva o rodapé dos controles: a árvore cresce apenas até antes
         # dele e nunca pode empurrar “Executar daqui” para fora do cartão.
         tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 43))
-        compact = ttk.Treeview(tree_frame, columns=("kind", "start", "wait"), show="tree headings", height=24,
+        compact = ttk.Treeview(tree_frame, columns=("kind", "start", "duration", "wait"), show="tree headings", height=24,
                                selectmode="extended")
         compact.heading("#0", text="Grupo / etapa")
         compact.heading("kind", text="Ação")
         compact.heading("start", text="Início")
+        compact.heading("duration", text="Duração")
         compact.heading("wait", text="Espera")
-        compact.column("#0", width=138, stretch=True)
-        compact.column("kind", width=66, anchor="w", stretch=False)
-        compact.column("start", width=104, anchor="w", stretch=False)
+        compact.column("#0", width=104, stretch=True)
+        compact.column("kind", width=55, anchor="w", stretch=False)
+        compact.column("start", width=76, anchor="w", stretch=False)
+        compact.column("duration", width=58, anchor="e", stretch=False)
         compact.column("wait", width=52, anchor="e", stretch=False)
         compact.pack(side="left", fill="both", expand=True, padx=1, pady=1)
         compact_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=compact.yview)
@@ -2682,6 +2806,8 @@ class MacroApp(tk.Tk):
             serial, self.device_execution_states.get(serial, {}).get("running")
         )
         compact.bind("<<TreeviewSelect>>", lambda _event: self._grid_compact_tree_selected(serial, panel, compact))
+        compact.bind("<FocusIn>", lambda _event, value=panel: setattr(self, "grid_focused_panel", str(value)), add="+")
+        compact.bind("<ButtonPress-1>", lambda _event, value=panel: setattr(self, "grid_focused_panel", str(value)), add="+")
         # No painel Celulares Ctrl+F mantém o mesmo propósito da tela
         # principal: abrir a busca de etapas para adicionar ao fluxo.
         compact.bind("<Control-f>", self.focus_action_search)
@@ -2708,7 +2834,7 @@ class MacroApp(tk.Tk):
                       width=78, height=28, corner_radius=7, fg_color="#2b2d35", hover_color="#3b3e49").pack(side="right")
         shortcuts = {
             "<Alt-Down>": "run_from", "<space>": "run", "<Delete>": "delete", "<F2>": "rename",
-            "<F3>": "toggle", "<F4>": "variation_toggle", "<F5>": "variation", "<Control-Return>": "configure",
+            "<F3>": "toggle", "<F4>": "variation_toggle", "<F5>": "variation", "<F6>": "run_one", "<Control-Return>": "configure",
             "<Control-Up>": "up", "<Control-Down>": "down", "<Control-c>": "copy", "<Control-x>": "cut",
             "<Control-v>": "paste", "<Control-z>": "undo", "<Control-y>": "redo", "<Control-e>": "expand", "<Control-a>": "select_all",
             "<Shift-Home>": "boundary_start", "<Shift-End>": "boundary_end",
@@ -2718,6 +2844,8 @@ class MacroApp(tk.Tk):
             compact.bind(sequence, lambda _event, value=command: self._grid_tree_shortcut(serial, panel, compact, value))
         compact.bind("<Alt-Double-Button-1>",
                      lambda _event: self._grid_tree_shortcut(serial, panel, compact, "run_from"), add="+")
+        compact.bind("<Shift-Double-Button-1>",
+                     lambda _event: self._grid_tree_shortcut(serial, panel, compact, "run_one"), add="+")
         return detail
 
     def _append_device_grid_log(self, serial: str | None, entry: str) -> None:
@@ -2760,6 +2888,10 @@ class MacroApp(tk.Tk):
         if not preserve_live_views:
             self.grid_view_session += 1
         session = self.grid_view_session
+        # Durante a reconstrução as caixas dos cartões ainda mudam de lugar.
+        # Esconder primeiro evita que uma máscara fique visível sobre o
+        # telefone que acabou ocupando a posição antiga.
+        self._hide_grid_markers()
         if not preserve_live_views:
             self._stop_grid_live_views()
         cards = self.device_grid_cards
@@ -2785,7 +2917,9 @@ class MacroApp(tk.Tk):
         self.device_grid_card_widgets = {}
         self.device_grid_title_details = {}
         self.device_grid_flow_trees = {}
-        self.grid_marker_selected_items = {}
+        # A seleção pertence ao serial, não ao widget que acabou de ser
+        # recriado. Preservá-la permite restaurar a máscara correta depois da
+        # atualização/redisposição dos cartões.
         # CartÃµes seguem a largura de uma tela vertical. Assim a grade usa o
         # espaÃ§o para colocar mais celulares lado a lado, sem sobras enormes
         # dentro de cada cartÃ£o.
@@ -2826,7 +2960,17 @@ class MacroApp(tk.Tk):
             for panel_id in panel_order:
                 section = tk.Frame(cards, bg="#0d0d0f"); section.pack(fill="x", anchor="w", pady=(0, 18))
                 title = "Conectados sem painel ativo" if panel_id == "__unassigned__" else self.panel_name(panel_id)
-                tk.Label(section, text=title, bg="#0d0d0f", fg="#d8b4fe", font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 7))
+                section_heading = tk.Frame(section, bg="#0d0d0f")
+                section_heading.pack(fill="x", pady=(0, 7))
+                tk.Label(section_heading, text=title, bg="#0d0d0f", fg="#d8b4fe", font=("Segoe UI Semibold", 14)).pack(side="left")
+                if panel_id != "__unassigned__":
+                    ctk.CTkButton(section_heading, text="▶ Iniciar todos",
+                                  command=lambda target_panel=panel_id: self.run_all_devices_in_grid_panel(target_panel),
+                                  width=112, height=28, corner_radius=7, fg_color="#6d35bb", hover_color="#8552c7").pack(side="right")
+                    ctk.CTkEntry(section_heading, textvariable=self.start_delay_max, width=56, height=28,
+                                 corner_radius=7, fg_color="#222938", border_color="#465166", text_color="#f8fafc").pack(side="right", padx=(6, 3))
+                    tk.Label(section_heading, text="Início aleatório até (s):", bg="#0d0d0f", fg="#94a3b8",
+                             font=("Segoe UI", 10)).pack(side="right")
                 section_cards = tk.Frame(section, bg="#0d0d0f"); section_cards.pack(anchor="w")
                 panel_profiles = sorted(by_panel[panel_id], key=lambda item: str(self.saved_names.get(str(item.get("serial", "")), {}).get("name", "")).casefold())
                 expanded_count = sum(1 for profile in panel_profiles if str(profile.get("serial", "")) in self.device_grid_expanded_serials and panel_id != "__unassigned__")
@@ -2879,9 +3023,10 @@ class MacroApp(tk.Tk):
             screen_label = tk.Label(screen_host, text="Iniciando tela ao vivo…", bg="#090b10", fg="#94a3b8",
                                     font=("Segoe UI", 10), cursor="hand2")
             screen_label.pack(fill="both", expand=True)
-            screen_label.bind("<ButtonPress-1>", lambda event, target=serial: self._grid_pointer_start(target, event))
-            screen_label.bind("<ButtonRelease-1>", lambda event, target=serial: self._grid_pointer_end(target, event))
-            screen_label.bind("<MouseWheel>", lambda event, target=serial: self._grid_mouse_wheel(target, event))
+            for click_target in (screen_host, screen_label):
+                click_target.bind("<ButtonPress-1>", lambda event, target=serial: self._grid_pointer_start(target, event))
+                click_target.bind("<ButtonRelease-1>", lambda event, target=serial: self._grid_pointer_end(target, event))
+                click_target.bind("<MouseWheel>", lambda event, target=serial: self._grid_mouse_wheel(target, event))
             self.device_grid_hosts[serial] = screen_host
             self.device_grid_screen_labels[serial] = screen_label
             log_holder = tk.Frame(card, bg="#0c0e14", height=180)
@@ -3163,12 +3308,32 @@ class MacroApp(tk.Tk):
         screen = self._grid_screen_size(serial)
         if tree_item:
             self.grid_marker_selected_items[serial] = tree_item
-        source_item = (self.device_execution_states.get(serial, {}).get("running")
-                       or tree_item or self.grid_marker_selected_items.get(serial))
+        # O clique explícito deve aparecer de imediato. A próxima atualização
+        # real da execução volta a assumir a máscara desse mesmo telefone.
+        candidates = (
+            tree_item,
+            self.device_execution_states.get(serial, {}).get("running"),
+            self.grid_marker_selected_items.get(serial),
+        )
+        source_item = next((candidate for candidate in candidates if candidate), None)
         action = self._grid_action_for_tree_item(serial, source_item)
+        # Uma árvore compacta pode ser recriada entre o evento e o desenho.
+        # Se a referência antiga não existir mais, mantenha a última seleção
+        # válida do próprio cartão em vez de esconder a máscara sem motivo.
+        if action is None:
+            selected_item = self.grid_marker_selected_items.get(serial)
+            if selected_item and selected_item != source_item:
+                fallback = self._grid_action_for_tree_item(serial, selected_item)
+                if fallback is not None:
+                    source_item, action = selected_item, fallback
         xml_marker = self.grid_xml_marker_bounds.get(serial)
         picker_active = bool(self.grid_xml_picker and str(self.grid_xml_picker.get("serial", "")) == str(serial))
-        if not bounds or not screen or (action is None and xml_marker is None and not picker_active):
+        try:
+            user32 = ctypes.windll.user32
+            modifier_active = bool((user32.GetAsyncKeyState(0x11) | user32.GetAsyncKeyState(0x12)) & 0x8000)
+        except (AttributeError, OSError):
+            modifier_active = False
+        if not bounds or not screen or (action is None and xml_marker is None and not picker_active and not modifier_active):
             self._hide_grid_marker(serial)
             return
         canvas = self._ensure_grid_marker(serial)
@@ -3187,7 +3352,9 @@ class MacroApp(tk.Tk):
                 return (offset_x + round(dx * (shown_w - 1) / max(1, screen[0] - 1)),
                         offset_y + round(dy * (shown_h - 1) / max(1, screen[1] - 1)))
             canvas.configure(width=width, height=height); canvas.delete("all")
-            self._set_grid_marker_mouse_intercept(serial, picker_active)
+            # A mesma película usada pelo seletor XML bloqueia o scrcpy durante
+            # Ctrl/Alt; o gesto é tratado pelo editor e nunca toca o telefone.
+            self._set_grid_marker_mouse_intercept(serial, picker_active or modifier_active)
             if picker_active:
                 canvas.create_rectangle(2, 2, width - 3, height - 3, outline="#36d399", width=2)
                 canvas.create_text(width // 2, 20, text="Clique para escolher o elemento XML",
@@ -3243,6 +3410,18 @@ class MacroApp(tk.Tk):
                 if alt and not ctrl:
                     self._move_grid_selected_action(serial, event.x_root, event.y_root)
                     self.grid_edit_mouse_down = True
+                elif ctrl and not alt:
+                    panel = self._grid_panel_for_serial(serial) or self.flow_var.get()
+                    start = self._grid_point_to_macro(serial, event.x_root, event.y_root)
+                    if panel and start:
+                        # Registra no próprio evento do cartão. A sondagem
+                        # global continua apenas como reserva para scrcpy,
+                        # mas não pode mais perder um arrasto curto.
+                        began = time.monotonic()
+                        held_since = self.grid_ctrl_held_since.get(serial, began)
+                        self.grid_ctrl_record_starts[serial] = (start[0], start[1], began, max(0, round((began - held_since) * 1000)))
+                        self.grid_edit_mouse_down = True
+                        self.status.set("Gravando na tela do celular: solte o mouse para salvar o toque ou arrasto.")
                 return "break"
         except (AttributeError, OSError):
             pass
@@ -3375,6 +3554,12 @@ class MacroApp(tk.Tk):
             self._reload_compact_flow_tree(
                 compact, serial, panel, getattr(compact, "grid_fallback_model", "")
             )
+            compact_item = next((candidate for candidate, source in compact.grid_source_items.items()
+                                 if source == source_item and compact.exists(candidate)), "")
+            if compact_item:
+                compact.selection_set(compact_item)
+                compact.focus(compact_item)
+                compact.see(compact_item)
         self._update_grid_touch_marker(serial, source_item)
         self.status.set("Posição atualizada na tela do celular.")
 
@@ -3390,8 +3575,25 @@ class MacroApp(tk.Tk):
             down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
             ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            now = time.monotonic()
+            if ctrl and serial:
+                self.grid_ctrl_held_since.setdefault(serial, now)
+            elif not ctrl:
+                self.grid_ctrl_held_since.clear()
+            if alt and serial:
+                if self.grid_alt_armed_serial != serial:
+                    self.grid_alt_armed_serial = serial
+                    self.grid_alt_armed_at = time.monotonic()
+            elif not alt:
+                self.grid_alt_armed_serial = ""
+                self.grid_alt_armed_at = 0.0
             for target in tuple(self.grid_scrcpy_windows):
                 self._set_grid_scrcpy_passthrough(target, bool(target == serial and (ctrl or alt)))
+                self._set_grid_marker_mouse_intercept(
+                    target,
+                    bool(target == serial and (ctrl or alt))
+                    or bool(self.grid_xml_picker and str(self.grid_xml_picker.get("serial", "")) == str(target)),
+                )
             if self.grid_ctrl_record_starts and not down:
                 target, start = next(iter(self.grid_ctrl_record_starts.items()))
                 self.grid_ctrl_record_starts.pop(target, None)
@@ -3437,13 +3639,16 @@ class MacroApp(tk.Tk):
                     self._grid_prepare_panel_context(serial, panel)
                     start = self._grid_point_to_macro(serial, point.x, point.y)
                     if start:
-                        self.grid_ctrl_record_starts[serial] = (start[0], start[1], time.monotonic())
+                        began = time.monotonic()
+                        held_since = self.grid_ctrl_held_since.get(serial, began)
+                        self.grid_ctrl_record_starts[serial] = (start[0], start[1], began, max(0, round((began - held_since) * 1000)))
                         self.status.set("Gravando na tela do celular: solte o mouse para salvar o toque ou arrasto.")
-                elif panel and alt:
-                    # Reserva: em alguns drivers a janela nativa recebe o
-                    # pressionamento antes de o Tk entregar o evento ao rótulo.
-                    # Ainda exige Alt+clique dentro da tela e uma etapa já
-                    # selecionada; não há conversão ou escrita ao reconectar.
+                elif (panel and alt and self.grid_alt_armed_serial == serial
+                      and time.monotonic() - self.grid_alt_armed_at >= 0.12):
+                    # scrcpy é uma janela nativa e pode consumir o clique. O
+                    # atalho só vale após Alt armado sobre ESTE cartão e para a
+                    # etapa já selecionada dele; trocar janelas ou outro cartão
+                    # não fornece autorização para gravar coordenadas.
                     self._move_grid_selected_action(serial, point.x, point.y)
             self.grid_edit_mouse_down = down
         except (AttributeError, OSError, tk.TclError, RuntimeError):
@@ -3610,7 +3815,7 @@ class MacroApp(tk.Tk):
             except OSError:
                 continue
 
-    def _close_orphaned_scrcpy_views(self) -> None:
+    def _close_orphaned_scrcpy_views(self, wait: bool = False) -> None:
         """Fecha somente scrcpy iniciado por esta instância do Iggents.
 
         Isso cobre uma janela de prévia que tenha sobrevivido a uma troca de
@@ -3629,9 +3834,13 @@ class MacroApp(tk.Tk):
             for value in result.stdout.splitlines():
                 if not value.strip().isdigit():
                     continue
-                subprocess.Popen(["taskkill", "/PID", value.strip(), "/T", "/F"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                command = ["taskkill", "/PID", value.strip(), "/T", "/F"]
+                if wait:
+                    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=4, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                else:
+                    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -3855,6 +4064,9 @@ class MacroApp(tk.Tk):
         if not hasattr(self, "tree"):
             return
         query = self.tree_search_var.get().strip()
+        # Cada termo separado por vírgula é uma busca independente. Assim,
+        # "curtir, patrocinado" destaca as etapas de qualquer um dos dois.
+        queries = [part.strip() for part in query.split(",") if part.strip()]
         matches: list[tuple[float, str]] = []
 
         def walk(parent: str = ""):
@@ -3865,20 +4077,21 @@ class MacroApp(tk.Tk):
         for item in walk():
             tags = tuple(tag for tag in self.tree.item(item, "tags") if tag != "search_match")
             self.tree.item(item, tags=tags)
-            if not query:
+            if not queries:
                 continue
             values = " ".join(str(value) for value in self.tree.item(item, "values"))
             text = f"{self.tree.item(item, 'text')} {values}"
-            score = self._action_search_score(query, text)
-            if score is not None:
-                matches.append((float(score), item))
+            scores = [self._action_search_score(term, text) for term in queries]
+            valid_scores = [float(score) for score in scores if score is not None]
+            if valid_scores:
+                matches.append((max(valid_scores), item))
 
         matches.sort(key=lambda entry: -entry[0])
         query_changed = query != getattr(self, "_tree_search_last_query", "")
         self._tree_search_last_query = query
         self._tree_search_matches = [item for _score, item in matches]
         self._tree_search_index = -1
-        self.tree_search_count.set(f"{len(matches)} encontrada(s)" if query else "")
+        self.tree_search_count.set(f"{len(matches)} encontrada(s)" if queries else "")
         for _score, item in matches:
             tags = tuple(self.tree.item(item, "tags"))
             if "running" not in tags:
@@ -5302,6 +5515,8 @@ class MacroApp(tk.Tk):
         if editing_group:
             config.update({
                 "use_variation": bool(existing_value("use_variation", False)),
+                "delay_variation_min_ms": existing_value("delay_variation_min_ms"),
+                "delay_variation_max_ms": existing_value("delay_variation_max_ms"),
                 "delay_variation_pct": existing_value("delay_variation_pct"),
                 "position_variation_px": existing_value("position_variation_px"),
                 "end_position_variation_px": existing_value("end_position_variation_px"),
@@ -5312,6 +5527,8 @@ class MacroApp(tk.Tk):
             self._set_action_variation_defaults(defaults)
             config.update({
                 "use_variation": defaults.use_variation,
+                "delay_variation_min_ms": defaults.delay_variation_min_ms,
+                "delay_variation_max_ms": defaults.delay_variation_max_ms,
                 "delay_variation_pct": defaults.delay_variation_pct,
                 "position_variation_px": defaults.position_variation_px,
                 "end_position_variation_px": defaults.end_position_variation_px,
@@ -5518,7 +5735,7 @@ class MacroApp(tk.Tk):
             ttk.Label(dialog, text=label + ":").grid(row=row, column=0, padx=18, pady=6, sticky="w")
             ctk.CTkEntry(dialog, textvariable=values[key], width=220, height=30, corner_radius=8,
                          fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=row, column=1, padx=8, pady=6, sticky="w")
-        ttk.Label(dialog, text="O Nav-S confere todas as etapas XML na ordem. A 1ª (Curtir) apenas valida: se a chance passar, executa o primeiro toque gravado; caso contrário, segue o fluxo normal. Se a 2ª ou qualquer posterior também estiver na tela, ela prevalece e executa somente o arrasto gravado. Ao acabar o tempo, ele faz uma última consulta: se achar qualquer XML e houver mais de um toque gravado, executa somente o último toque do grupo uma vez antes de seguir. A rota alternativa roda depois dessa verificação.", wraplength=560).grid(row=13, column=0, columnspan=2, padx=18, pady=(8, 2), sticky="w")
+        ttk.Label(dialog, text="O Nav-S confere todas as etapas XML na ordem. A 1ª (Curtir) executa o primeiro toque quando a chance passar; se falhar, o Nav-S continua até o fim. Se a 2ª ou qualquer posterior também estiver na tela, ela prevalece e executa somente o arrasto gravado. Ao acabar o tempo, ele faz uma última consulta: se achar qualquer XML e houver mais de um toque gravado, executa somente o último toque do grupo uma vez. A rota alternativa já é criada no final do Nav-S e só é ignorada se nenhum XML for encontrado.", wraplength=560).grid(row=13, column=0, columnspan=2, padx=18, pady=(8, 2), sticky="w")
 
         def create():
             try:
@@ -5623,7 +5840,9 @@ class MacroApp(tk.Tk):
         if not action.use_variation:
             return
         try:
-            action.delay_variation_pct = max(0, float(self.delay_jitter.get()))
+            action.delay_variation_min_ms = max(0, float(self.delay_jitter_down.get()))
+            action.delay_variation_max_ms = max(0, float(self.delay_jitter_up.get()))
+            action.delay_variation_pct = None
             action.position_variation_px = max(0, int(self.position_jitter.get()))
             action.end_position_variation_px = max(0, int(self.end_position_jitter.get()))
             action.speed_variation_pct = max(0, float(self.speed_jitter.get()))
@@ -5631,14 +5850,29 @@ class MacroApp(tk.Tk):
             # A validação normal da execução continua avisando o usuário; aqui
             # mantemos a etapa compatível com os valores globais atuais.
             action.delay_variation_pct = None
+            action.delay_variation_min_ms = None
+            action.delay_variation_max_ms = None
             action.position_variation_px = None
             action.end_position_variation_px = None
             action.speed_variation_pct = None
 
+    @staticmethod
+    def _delay_variation_offsets(action: Action) -> tuple[float, float]:
+        """Retorna quanto a pausa pode reduzir/aumentar, em milissegundos."""
+        if not action.use_variation:
+            return 0.0, 0.0
+        # O valor legado era percentual simétrico; só macros antigas chegam
+        # aqui sem os novos limites em ms.
+        legacy = max(0.0, action.delay_ms * float(action.delay_variation_pct or 0) / 100)
+        down = max(0.0, float(action.delay_variation_min_ms if action.delay_variation_min_ms is not None else legacy))
+        up = max(0.0, float(action.delay_variation_max_ms if action.delay_variation_max_ms is not None else legacy))
+        return down, up
+
     def apply_variation_to_selected(self) -> None:
         """Aplica os valores atuais às etapas ou grupos selecionados."""
         try:
-            delay = max(0, float(self.delay_jitter.get()))
+            delay_min = max(0, float(self.delay_jitter_down.get()))
+            delay_max = max(0, float(self.delay_jitter_up.get()))
             position = max(0, int(self.position_jitter.get()))
             end_position = max(0, int(self.end_position_jitter.get()))
             speed = max(0, float(self.speed_jitter.get()))
@@ -5672,7 +5906,9 @@ class MacroApp(tk.Tk):
                 group = groups[group_index]
                 if group.get("xml_any_tap_group"):
                     group["use_variation"] = self.variations_enabled.get()
-                    group["delay_variation_pct"] = delay if group["use_variation"] else None
+                    group["delay_variation_min_ms"] = delay_min if group["use_variation"] else None
+                    group["delay_variation_max_ms"] = delay_max if group["use_variation"] else None
+                    group["delay_variation_pct"] = None
                     group["position_variation_px"] = position if group["use_variation"] else None
                     group["end_position_variation_px"] = end_position if group["use_variation"] else None
                     group["speed_variation_pct"] = speed if group["use_variation"] else None
@@ -5694,7 +5930,9 @@ class MacroApp(tk.Tk):
         self.push_undo()
         for action in targets:
             action.use_variation = self.variations_enabled.get()
-            action.delay_variation_pct = delay if action.use_variation else None
+            action.delay_variation_min_ms = delay_min if action.use_variation else None
+            action.delay_variation_max_ms = delay_max if action.use_variation else None
+            action.delay_variation_pct = None
             action.position_variation_px = position if action.use_variation else None
             action.end_position_variation_px = end_position if action.use_variation else None
             action.speed_variation_pct = speed if action.use_variation else None
@@ -5825,6 +6063,11 @@ class MacroApp(tk.Tk):
         ultrapassam a tela registrada. Etapas dentro dela já estão corretas e
         nunca são alteradas aqui.
         """
+        # Coordenadas gravadas são dados imutáveis fora de uma edição
+        # explícita. Esta migração antiga não é mais aplicada, nem mesmo para
+        # pontos fora da tela, pois uma inferência automática jamais pode
+        # prevalecer sobre a posição que a pessoa gravou.
+        return
         try:
             raw_w, raw_h = (int(float(value)) for value in raw_size)
         except (TypeError, ValueError):
@@ -6341,7 +6584,12 @@ class MacroApp(tk.Tk):
         bounds = self.scrcpy_client_bounds or self.scrcpy_window_bounds
         xml_bounds = self.live_xml_marker_bounds
         picker_active = bool(self.live_xml_picker and str(self.live_xml_picker.get("serial", "")) == str(self.scrcpy_serial))
-        if not self.live_view_mode or not bounds or (action is None and xml_bounds is None and not picker_active) or not self._live_view_has_foreground():
+        try:
+            user32 = ctypes.windll.user32
+            modifier_active = bool((user32.GetAsyncKeyState(0x11) | user32.GetAsyncKeyState(0x12)) & 0x8000)
+        except (AttributeError, OSError):
+            modifier_active = False
+        if not self.live_view_mode or not bounds or (action is None and xml_bounds is None and not picker_active and not modifier_active) or not self._live_view_has_foreground():
             self._hide_live_touch_marker(); return
         canvas = self._ensure_live_marker()
         if canvas is None or not self.live_marker_window:
@@ -6364,7 +6612,7 @@ class MacroApp(tk.Tk):
                         offset_y + round(y * max(0, image_height - 1) / max(1, coordinate_screen[1] - 1)))
             canvas.configure(width=width, height=height)
             canvas.delete("all")
-            self._set_live_marker_mouse_intercept(picker_active)
+            self._set_live_marker_mouse_intercept(picker_active or modifier_active)
             if picker_active:
                 canvas.create_rectangle(2, 2, width - 3, height - 3, outline="#36d399", width=2)
                 canvas.create_text(width // 2, 20, text="Clique para escolher o elemento XML",
@@ -6494,7 +6742,7 @@ class MacroApp(tk.Tk):
             max(0, min(macro_h - 1, round(device_point[1] * (macro_h - 1) / max(1, current_h - 1)))),
         )
 
-    def _append_live_preview_gesture(self, start: tuple[int, int, float], end: tuple[int, int]) -> None:
+    def _append_live_preview_gesture(self, start: tuple[int, int, float, int], end: tuple[int, int]) -> None:
         """Inclui uma etapa criada sobre o scrcpy no mesmo ponto das gravações."""
         # Execuções são controladas por painel. A antiga referência
         # ``run_thread`` não existe mais e falhava justamente ao soltar o mouse.
@@ -6503,13 +6751,12 @@ class MacroApp(tk.Tk):
         if current_panel_running or pending_only:
             self.status.set("Pare a execução antes de gravar uma etapa pela tela ao vivo.")
             return
-        sx, sy, began = start
+        sx, sy, began, ctrl_wait_ms = start
         ex, ey = end
         ended = time.monotonic()
         distance = abs(ex - sx) + abs(ey - sy)
         duration = max(40, round((ended - began) * 1000))
-        delay = (400 if self._live_ctrl_record_previous_end is None
-                 else max(0, round((began - self._live_ctrl_record_previous_end) * 1000)))
+        delay = ctrl_wait_ms
         if distance < 35:
             action = Action("tap", sx, sy, duration_ms=duration, delay_ms=delay)
         else:
@@ -6537,12 +6784,20 @@ class MacroApp(tk.Tk):
             down = bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
             alt_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x12) & 0x8000)
             ctrl_down = bool(ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000)
+            now = time.monotonic()
+            if ctrl_down:
+                if self._live_ctrl_held_since is None:
+                    self._live_ctrl_held_since = now
+            else:
+                self._live_ctrl_held_since = None
             picker = self.live_xml_picker
             picker_active = bool(picker and self.live_view_mode
                                  and str(picker.get("serial", "")) == str(self.scrcpy_serial))
             # Durante a escolha de XML, o clique não pode alcançar o telefone:
             # ele serve exclusivamente para escolher o nó sob o cursor.
-            self._set_scrcpy_alt_passthrough((alt_down or ctrl_down or picker_active) and self.live_view_mode)
+            modifier_blocking = (alt_down or ctrl_down or picker_active) and self.live_view_mode
+            self._set_scrcpy_alt_passthrough(modifier_blocking)
+            self._set_live_marker_mouse_intercept(modifier_blocking)
             can_edit = self.live_view_mode and (self.live_view_edit_mode or alt_down)
             if self._live_ctrl_record_start is not None and not down:
                 point = wintypes.POINT()
@@ -6567,7 +6822,9 @@ class MacroApp(tk.Tk):
                 elif ctrl_down and not alt_down and inside_live_view:
                     start = self._live_view_point_to_macro(point, self.scrcpy_window_bounds)
                     if start is not None:
-                        self._live_ctrl_record_start = (start[0], start[1], time.monotonic())
+                        began = time.monotonic()
+                        held_since = self._live_ctrl_held_since if self._live_ctrl_held_since is not None else began
+                        self._live_ctrl_record_start = (start[0], start[1], began, max(0, round((began - held_since) * 1000)))
                         self._live_ctrl_record_mouse_down = True
                         self.status.set("Gravando pela tela ao vivo: solte o mouse para salvar o toque ou arrasto.")
                 elif can_edit and inside_live_view:
@@ -6605,7 +6862,12 @@ class MacroApp(tk.Tk):
             # Ctrl/Alt na janela nativa do scrcpy precisa de uma leitura mais
             # frequente que a prévia comum para não perder um clique rápido.
             grid_open = bool(getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares")
-            self.after(15 if grid_open else 45, self._poll_live_coordinate_editing)
+            # A janela do scrcpy é nativa: não recebemos seu evento de mouse
+            # pelo Tk. Com 45 ms, toques curtos com Ctrl podiam ocorrer
+            # inteiros entre duas leituras e pareciam falhar ao acaso. Enquanto
+            # houver uma prévia ao vivo, use a mesma cadência curta da grade.
+            live_recording_surface = bool(self.live_view_mode and self.scrcpy_window_bounds)
+            self.after(8 if grid_open or live_recording_surface else 45, self._poll_live_coordinate_editing)
 
     def enable_preview_editing(self) -> None:
         """Troca a visualização em tempo real pela imagem clicável da etapa."""
@@ -7202,6 +7464,40 @@ class MacroApp(tk.Tk):
         except tk.TclError:
             return
 
+    def _collapse_finished_grid_containers(self, serial: str, previous_item: str | None) -> None:
+        """Recolhe pais cujo último filho acabou de terminar no cartão."""
+        if not previous_item:
+            return
+        tree = self.device_grid_flow_trees.get(serial)
+        if not tree or not tree.winfo_exists():
+            return
+        try:
+            reverse = {source: compact for compact, source in tree.grid_source_items.items()}
+            current = reverse.get(previous_item, "")
+            while current:
+                parent = tree.parent(current)
+                if not parent or tree.next(current):
+                    break
+                tree.item(parent, open=False)
+                current = parent
+        except tk.TclError:
+            pass
+
+    def _collapse_finished_main_containers(self, previous_item: str | None) -> None:
+        """Aplica ao Fluxo o mesmo recolhimento ao terminar o último filho."""
+        if not previous_item or not self.tree.exists(previous_item):
+            return
+        try:
+            current = previous_item
+            while current:
+                parent = self.tree.parent(current)
+                if not parent or self.tree.next(current):
+                    break
+                self.tree.item(parent, open=False)
+                current = parent
+        except tk.TclError:
+            pass
+
     def set_running_item(self, item: str | None, serial: str | None = None) -> None:
         """Registra a linha atual separadamente para cada telefone."""
         # Cada etapa troca o destaque visual. A marcação XML é válida somente
@@ -7216,6 +7512,10 @@ class MacroApp(tk.Tk):
             self.grid_xml_marker_bounds.pop(serial, None)
         if serial:
             state = self.device_execution_states.setdefault(serial, {"running": None})
+            previous_item = state.get("running")
+            if previous_item and previous_item != item:
+                self._collapse_finished_grid_containers(serial, str(previous_item))
+                self._collapse_finished_main_containers(str(previous_item))
             state["running"] = item
             self._refresh_device_grid_title(serial)
         # Na grade, redesenhar a árvore principal oculta a cada evento de cada
@@ -7229,7 +7529,9 @@ class MacroApp(tk.Tk):
             self._render_grid_running_step(serial, item)
         # A máscara é atualizada no mesmo evento que troca o destaque da
         # árvore; não há captura extra de tela nem custo perceptível.
-        if not in_grid:
+        if in_grid and serial:
+            self._update_grid_touch_marker(serial, item)
+        elif not in_grid:
             self._update_live_touch_marker(item)
 
     def _request_execution_ui_commit(self) -> None:
@@ -9403,7 +9705,9 @@ class MacroApp(tk.Tk):
         return (
             "base { log_debug = off; log_info = on; log = \"stderr\"; daemon = off; redirector = iptables; }\n"
             "redsocks { bind = \"127.0.0.1:8124\"; "
-            f"relay = \"{escape(host)}:{port}\"; type = http-connect; "
+            # A versão embarcada no telefone usa ``relay`` como endereço
+            # completo e não implementa a chave ``relay_port``.
+            f"relay = \"{escape(host)}:{int(port)}\"; type = http-connect; "
             f"login = \"{escape(user)}\"; password = \"{escape(password)}\"; }}\n"
         )
 
@@ -9837,13 +10141,16 @@ class MacroApp(tk.Tk):
         dialog.minsize(700, 550)
         dialog.configure(bg="#171b26")
         dialog.transient(self); dialog.grab_set()
-        dialog.grid_rowconfigure(3, weight=1)
+        dialog.grid_rowconfigure(5, weight=1)
         dialog.grid_columnconfigure(1, weight=1)
         selector_type = tk.StringVar(value="Texto")
         selector_value = tk.StringVar(value=str(existing.selector_value or "") if existing else "")
         selector_blocked_text = tk.StringVar(value=str(existing.selector_blocked_text or "") if existing else "")
         match_mode = tk.StringVar(value="Contém" if existing and existing.match_mode == "contains" else "Exato")
         timeout = tk.StringVar(value=str(existing.timeout_s) if existing else "10")
+        unavailable_tap = tk.BooleanVar(value=bool(existing and existing.xml_unavailable_tap_x is not None and existing.xml_unavailable_tap_y is not None))
+        unavailable_x = tk.StringVar(value=str(existing.xml_unavailable_tap_x) if existing and existing.xml_unavailable_tap_x is not None else "")
+        unavailable_y = tk.StringVar(value=str(existing.xml_unavailable_tap_y) if existing and existing.xml_unavailable_tap_y is not None else "")
         ttk.Label(dialog, text="Encontrar por:").grid(row=0, column=0, padx=18, pady=(18, 8), sticky="w")
         kind_box = ttk.Combobox(dialog, textvariable=selector_type, state="readonly", values=("Texto", "Descrição", "ID", "Classe"), width=16)
         kind_box.grid(row=0, column=1, padx=8, pady=(18, 8), sticky="w")
@@ -9860,9 +10167,13 @@ class MacroApp(tk.Tk):
         ctk.CTkEntry(dialog, textvariable=timeout, width=48, height=30, corner_radius=8,
                      fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=3, column=3, padx=4, pady=8, sticky="w")
         ttk.Label(dialog, text="segundos").grid(row=3, column=4, padx=(2, 12), pady=8, sticky="w")
+        ctk.CTkCheckBox(dialog, text="Se XML indisponível, tocar em:", variable=unavailable_tap,
+                        width=190, checkbox_width=17, checkbox_height=17).grid(row=4, column=0, padx=18, pady=(2, 5), sticky="w")
+        ctk.CTkEntry(dialog, textvariable=unavailable_x, width=72, height=28, placeholder_text="X").grid(row=4, column=1, padx=(8, 3), pady=(2, 5), sticky="w")
+        ctk.CTkEntry(dialog, textvariable=unavailable_y, width=72, height=28, placeholder_text="Y").grid(row=4, column=1, padx=(86, 3), pady=(2, 5), sticky="w")
         elements = tk.Listbox(dialog, height=11, width=78, bg="#202737", fg="#e7edf7", selectbackground="#2d5eb8",
                               highlightthickness=0, borderwidth=0, activestyle="none")
-        elements.grid(row=4, column=0, columnspan=5, padx=18, pady=(12, 8), sticky="nsew")
+        elements.grid(row=5, column=0, columnspan=5, padx=18, pady=(12, 8), sticky="nsew")
         captured: list[dict[str, str]] = []
         filtered: list[dict[str, str]] = []
         exact_choice: dict[str, str] = {}
@@ -9877,7 +10188,7 @@ class MacroApp(tk.Tk):
                                          if restart_loop else
                                          "Se encontrar, o grupo continua; se não, o restante do grupo será ignorado."
                                          if gate_group else "Capture o XML da tela e pesquise um item acima."))
-        ttk.Label(dialog, textvariable=result_info, wraplength=720).grid(row=5, column=0, columnspan=5, padx=18, sticky="w")
+        ttk.Label(dialog, textvariable=result_info, wraplength=720).grid(row=6, column=0, columnspan=5, padx=18, sticky="w")
 
         def render_results(*_args):
             query = selector_value.get().strip().casefold()
@@ -9967,6 +10278,11 @@ class MacroApp(tk.Tk):
             try: wait = max(1, int(timeout.get()))
             except ValueError:
                 messagebox.showwarning("XML", "Informe um tempo de espera válido.", parent=dialog); return
+            try:
+                fallback_x = int(unavailable_x.get()) if unavailable_tap.get() else None
+                fallback_y = int(unavailable_y.get()) if unavailable_tap.get() else None
+            except ValueError:
+                messagebox.showwarning("XML", "Informe X e Y válidos para o toque de contingência.", parent=dialog); return
             if not value and not exact_choice:
                 messagebox.showwarning("XML", "Informe ou escolha um elemento.", parent=dialog); return
             self.push_undo()
@@ -9976,6 +10292,7 @@ class MacroApp(tk.Tk):
                 existing.selector_blocked_text = selector_blocked_text.get().strip() or None
                 existing.match_mode = "exact" if exact_choice else "contains"
                 existing.timeout_s = wait
+                existing.xml_unavailable_tap_x, existing.xml_unavailable_tap_y = fallback_x, fallback_y
                 item = (f"a:{action_ref[0]}:{action_ref[1]}" if action_ref is not None
                         else tree_ref if tree_ref is not None
                         else f"s:{nested_ref[0]}:{nested_ref[1]}:{nested_ref[2]}")
@@ -9983,7 +10300,14 @@ class MacroApp(tk.Tk):
                 new_action = Action("xml_restart_loop" if restart_loop else "xml_group_gate" if gate_group else "xml_tap", selector_type="exact_xml" if exact_choice else "search",
                                     selector_value=json.dumps(exact_choice, ensure_ascii=False, sort_keys=True) if exact_choice else value,
                                     selector_blocked_text=selector_blocked_text.get().strip() or None,
-                                    match_mode="exact" if exact_choice else "contains", timeout_s=wait)
+                                    match_mode="exact" if exact_choice else "contains", timeout_s=wait,
+                                    xml_unavailable_tap_x=fallback_x, xml_unavailable_tap_y=fallback_y)
+                # XML de toque também precisa congelar a configuração de
+                # variação vigente no momento em que é criado. A posição
+                # encontrada no XML recebe essa variação no executor, como
+                # acontece com os toques gravados normalmente.
+                if new_action.kind == "xml_tap":
+                    self._set_action_variation_defaults(new_action)
                 if inline_nav_actions is not None:
                     inline_nav_actions.append(asdict(new_action))
                     item = inline_item
@@ -10009,9 +10333,28 @@ class MacroApp(tk.Tk):
                       fg_color="#2f6fed", hover_color="#4b82ee").grid(row=6, column=4, padx=18, pady=12, sticky="e")
         # A janela já abre com a tela atual lida e pronta para pesquisar.
         dialog.after(80, capture)
-        # O popup ainda está terminando de entrar na frente nesse momento;
-        # aguardar um ciclo extra mantém a digitação diretamente no campo XML.
-        dialog.after(180, lambda: (dialog.lift(), value_entry.focus_set()))
+        # A janela nativa do celular pode terminar seu reposicionamento depois
+        # do primeiro ``Map``. Dê foco explicitamente ao campo já com o diálogo
+        # na frente; isso atua só dentro do Iggents e não ativa outros apps.
+        def focus_xml_search() -> None:
+            try:
+                if dialog.winfo_exists():
+                    dialog.lift()
+                    # O scrcpy é uma janela nativa e, em alguns aparelhos,
+                    # ainda mantém o foco do Windows mesmo após o diálogo Tk
+                    # aparecer. Traga o diálogo ao primeiro plano antes de
+                    # focar a entrada, sem tocar na tela do telefone.
+                    try:
+                        ctypes.windll.user32.SetForegroundWindow(wintypes.HWND(dialog.winfo_id()))
+                    except (AttributeError, OSError):
+                        pass
+                    value_entry.focus_force()
+                    value_entry.select_range(0, "end")
+            except tk.TclError:
+                pass
+        dialog.after(120, focus_xml_search)
+        dialog.after(350, focus_xml_search)
+        dialog.after(800, focus_xml_search)
         value_entry.bind("<Return>", lambda _event: (add(), "break")[1])
 
     def add_xml_logic_action(self, group_index: int | None = None) -> None:
@@ -10170,6 +10513,12 @@ class MacroApp(tk.Tk):
                 self.tree.selection_set(f"g:{selected_group}")
                 self.tree.focus(f"g:{selected_group}")
             self.save_macro(); dialog.destroy()
+            # Em Celulares a árvore compacta é outro widget. Atualize-a logo
+            # após salvar para que um XML condicional criado dentro de um
+            # subgrupo apareça imediatamente, sem precisar fechar/reabrir o
+            # painel.
+            if getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares":
+                self.after_idle(lambda current=self.flow_var.get(): self._reload_compact_trees_for_panel(current))
             self.status.set("Grupo XML condicional salvo. Adicione as etapas dentro dele.")
         query.trace_add("write", render)
         blocked.trace_add("write", render)
@@ -10335,6 +10684,20 @@ class MacroApp(tk.Tk):
             raise RuntimeError(f"{profile.get('name') or profile.get('id')}: a API não retornou um código.")
         return profile, code
 
+    def _check_number_code_once(self, provider_id: str | None, order_id: str) -> tuple[dict, str]:
+        """Lê uma vez o código do pedido atual, sem entrar em espera."""
+        profile, driver = self._number_api_driver(provider_id)
+        check = getattr(driver, "check_code", None)
+        if not callable(check):
+            raise RuntimeError(f"{profile.get('name') or profile.get('id')}: esta API não oferece consulta imediata de código.")
+        try:
+            code = str(check(dict(profile), str(order_id)) or "").strip()
+        except Exception as error:
+            raise RuntimeError(f"{profile.get('name') or profile.get('id')}: não foi possível consultar o código: {error}") from error
+        if not code:
+            raise RuntimeError(f"{profile.get('name') or profile.get('id')}: código ainda não disponível no pedido {order_id}.")
+        return profile, code
+
     def _finish_number_order(self, provider_id: str | None, order_id: str) -> None:
         """Finaliza o pedido quando o driver oferecer essa operação."""
         profile, driver = self._number_api_driver(provider_id)
@@ -10373,7 +10736,7 @@ class MacroApp(tk.Tk):
 
     def _save_settings(self, *_args) -> None:
         data = dict(self.settings)
-        data.update({"delay_jitter": self.delay_jitter.get(), "position_jitter": self.position_jitter.get(),
+        data.update({"delay_jitter_down": self.delay_jitter_down.get(), "delay_jitter_up": self.delay_jitter_up.get(), "position_jitter": self.position_jitter.get(),
                 "end_position_jitter": self.end_position_jitter.get(),
                 "speed_jitter": self.speed_jitter.get(), "minimum_delay": self.minimum_delay.get(),
                 "start_delay_max": self.start_delay_max.get(), "show_touches": self.show_touches_var.get(),
@@ -11201,7 +11564,52 @@ class MacroApp(tk.Tk):
                 item = value if isinstance(value, Action) else Action(**value)
                 tree_item = f"{tree_prefix}:{value_index}" if tree_prefix else None
                 if item.kind == "subgroup":
-                    flattened.extend(flatten_nested_actions(item.nested_actions or [], child_tree_prefix(tree_item)))
+                    label_key = "".join(
+                        char for char in unicodedata.normalize("NFKD", str(item.label or "").casefold())
+                        if not unicodedata.combining(char)
+                    ).strip()
+                    has_restart_parent = any(
+                        (child if isinstance(child, Action) else Action(**child)).kind == "restart_parent_group"
+                        for child in (item.nested_actions or [])
+                    )
+                    is_code_failure_group = bool(item.number_code_failure_group) or (
+                        label_key == "codigo nao chegou" and has_restart_parent
+                    )
+                    if is_code_failure_group:
+                        # Rota especial dentro de XML/Nav também não pode ser
+                        # achatada: se o fizer, "Reiniciar grupo pai" entra no
+                        # ciclo normal do Loop, exatamente como ocorria aqui.
+                        raw = asdict(copy.deepcopy(item))
+                        raw["kind"] = "number_code_failure_group"
+                        raw["tree_item"] = tree_item
+                        raw["branch_actions"] = flatten_nested_actions(
+                            item.nested_actions or [], child_tree_prefix(tree_item)
+                        )
+                        flattened.append(raw)
+                    else:
+                        nested_flat = flatten_nested_actions(item.nested_actions or [], child_tree_prefix(tree_item))
+                        # Cada rota de falha recebe uma cópia explícita das
+                        # etapas do grupo que a contém. Isso elimina qualquer
+                        # tentativa de descobrir o pai depois que XML/Loop já
+                        # achatou a árvore em listas diferentes.
+                        for nested_raw in nested_flat:
+                            if (nested_raw.get("kind") != "number_code_failure_group"
+                                    or nested_raw.get("restart_parent_actions") is not None):
+                                continue
+                            parent_path = str(nested_raw.get("tree_item") or "").rsplit(":", 1)[0]
+                            nested_raw["restart_parent_actions"] = copy.deepcopy([
+                                candidate for candidate in nested_flat
+                                if str(candidate.get("tree_item") or "").rsplit(":", 1)[0] == parent_path
+                            ])
+                            # A linha final também precisa saber o alvo. Isso
+                            # cobre "Executar daqui" nela própria, quando a
+                            # rota condicional não foi percorrida antes.
+                            for recovery_step in nested_raw.get("branch_actions") or []:
+                                if recovery_step.get("kind") == "restart_parent_group":
+                                    recovery_step["restart_parent_actions"] = copy.deepcopy(
+                                        nested_raw["restart_parent_actions"]
+                                    )
+                        flattened.extend(nested_flat)
                 else:
                     raw = asdict(copy.deepcopy(item))
                     raw["tree_item"] = tree_item
@@ -11300,7 +11708,22 @@ class MacroApp(tk.Tk):
             """Achata subgrupos para a execuÃ§Ã£o, mantendo a ordem em que aparecem."""
             if item.kind == "subgroup":
                 child_prefix = child_tree_prefix(tree_item)
-                if item.number_code_failure_group:
+                # Macros criadas antes da flag ``number_code_failure_group``
+                # também precisam tratar "Código não chegou" como rota
+                # condicional. Sem isso o subgrupo era achatado no Loop e a
+                # própria etapa "Reiniciar grupo pai" rodava em todo ciclo.
+                item_label_key = "".join(
+                    char for char in unicodedata.normalize("NFKD", str(item.label or "").casefold())
+                    if not unicodedata.combining(char)
+                ).strip()
+                has_restart_parent = any(
+                    (child if isinstance(child, Action) else Action(**child)).kind == "restart_parent_group"
+                    for child in (item.nested_actions or [])
+                )
+                is_code_failure_group = bool(item.number_code_failure_group) or (
+                    item_label_key == "codigo nao chegou" and has_restart_parent
+                )
+                if is_code_failure_group:
                     # Esta rota não faz parte do caminho normal. Ela é mantida
                     # como uma única ação de controle para a etapa de código
                     # poder executá-la somente após uma falha.
@@ -11536,6 +11959,8 @@ class MacroApp(tk.Tk):
                                       xml_any_max_rounds=max(1, int(group.get("xml_any_max_rounds", 1))),
                                       flow_group=group_index, enabled=bool(group.get("enabled", True)),
                                       use_variation=bool(group.get("use_variation", False)),
+                                      delay_variation_min_ms=group.get("delay_variation_min_ms"),
+                                      delay_variation_max_ms=group.get("delay_variation_max_ms"),
                                       delay_variation_pct=group.get("delay_variation_pct"),
                                       position_variation_px=group.get("position_variation_px"),
                                       end_position_variation_px=group.get("end_position_variation_px"),
@@ -12425,7 +12850,7 @@ class MacroApp(tk.Tk):
             self.stopping_panels.add(panel)
             self.execution_stopping = bool(self.stopping_panels)
         if panel_run:
-            panel_run.stop_event.set()
+            panel_run.stop_now()
             # A parada é cooperativa para ADB, mas a interface não precisa
             # ficar bloqueada esperando a última chamada retornar. Remove a
             # sessão ativa agora; eventos atrasados dela são ignorados pelo id.
@@ -12460,9 +12885,16 @@ class MacroApp(tk.Tk):
     def escape_stop(self, event=None, *, global_request: bool = False):
         # Dentro do programa, Esc só é válido quando veio de uma lista de
         # etapas. Fora dele, o observador global usa o painel aberto.
-        panel = self._panel_of_focused_task_tree(event)
+        in_grid = bool(getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares")
+        panel = (str(getattr(self, "grid_focused_panel", "") or "") if in_grid
+                 else self._panel_of_focused_task_tree(event))
+        if (not panel and in_grid and not global_request):
+            # A janela scrcpy não ganha foco, portanto depois de clicar nela o
+            # foco Tk pode continuar em outro widget. Mantemos o último painel
+            # cuja lista compacta recebeu foco, sem jamais usar flow_var aqui.
+            panel = str(getattr(self, "grid_focused_panel", "") or "")
         if not panel and global_request:
-            panel = self.flow_var.get()
+            panel = str(getattr(self, "grid_focused_panel", "") or "") if in_grid else self.flow_var.get()
         if not panel:
             return "break"
         if panel not in self.panel_runs and not (self.execution_refresh_pending and panel == self.flow_var.get()):
@@ -12488,10 +12920,13 @@ class MacroApp(tk.Tk):
         except (AttributeError, OSError):
             is_down = False
             app_has_focus = False
-        if (is_down and not self._global_escape_was_down
-                and (bool(self.panel_runs) or self.execution_refresh_pending)
-                and not app_has_focus):
-            self.escape_stop(global_request=True)
+        target = self.pc_automation_escape_target
+        if (is_down and not self._global_escape_was_down and not app_has_focus
+                and target is not None and target[0] in self.panel_runs):
+            # Fora do app, Esc só é ativo durante automação no PC. O alvo vem
+            # do worker que a iniciou, nunca do painel atualmente visível.
+            self.stop_all(target[0])
+            self.pc_automation_escape_target = None
         self._global_escape_was_down = is_down
         try:
             self.after(50, self._poll_global_escape)
@@ -12539,6 +12974,36 @@ class MacroApp(tk.Tk):
         self.run_from_selection()
         return "break"
 
+    def shortcut_run_selected_action(self, _event=None):
+        if self._typing_in_field():
+            return None
+        self.run_selected_action()
+        return "break"
+
+    def run_selected_action(self, only_serial: str | None = None) -> None:
+        """Reproduz exatamente uma etapa, sem continuar seus irmãos."""
+        selected = self.tree.selection()
+        focused = self.tree.focus()
+        item = focused if focused in selected else (selected[0] if selected else "")
+        location = self._tree_action_container(item) if item else None
+        if location is None:
+            messagebox.showwarning("Reproduzir etapa", "Selecione uma etapa, não um grupo.")
+            return
+        group_index, actions, action_index = location
+        if not 0 <= action_index < len(actions):
+            return
+        action = copy.deepcopy(actions[action_index])
+        if not isinstance(action, Action):
+            action = Action(**action)
+        action.flow_group = group_index
+        action.flow_action_index = int(item.split(":")[2]) if len(item.split(":")) > 2 else action_index
+        action.tree_item = item
+        action.run_immediately = True
+        profiles = self.selected_profiles()
+        serial = str(only_serial or (profiles[0].get("serial", "") if profiles else self.adb.serial or ""))
+        self.run_macro(refresh_first=False, run_all_panels=False, only_serial=serial,
+                       action_override=action)
+
     def execute_from_tree_double_click(self, event):
         """Atalho prático para testar uma etapa diretamente na lista."""
         item = self.tree.identify_row(event.y)
@@ -12547,6 +13012,16 @@ class MacroApp(tk.Tk):
         self.tree.selection_set(item)
         self.tree.focus(item)
         self.run_from_selection()
+        return "break"
+
+    def execute_selected_tree_double_click(self, event):
+        """Shift + duplo clique reproduz apenas a linha clicada."""
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return "break"
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        self.run_selected_action()
         return "break"
 
     def configure_selected_from_shortcut(self, _event=None):
@@ -12649,6 +13124,17 @@ class MacroApp(tk.Tk):
                 except (IndexError, ValueError):
                     pass
             nested_path = [int(value) for value in parts[2:]]
+            # "Reiniciar grupo pai" é um comando de controle. Ao depurá-lo
+            # isoladamente, o início correto é o pai de "Código não chegou"
+            # (duas camadas acima), e não a própria linha de comando.
+            location = self._tree_action_container(start_item)
+            if location is not None:
+                _selected_group, selected_actions, selected_index = location
+                if (0 <= selected_index < len(selected_actions)
+                        and selected_actions[selected_index].kind == "restart_parent_group"
+                        and len(nested_path) >= 2):
+                    nested_path = nested_path[:-2]
+                    self.status.set("Executando desde o início do grupo pai de ‘Código não chegou’.")
             display_index = self._selected_start_index(prefer_focus=True) or 0
             self.run_macro(display_index, run_all_panels=False, only_serial=only_serial, start_group_index=group_index,
                            start_nested_parent_index=nested_path[0] if nested_path else None,
@@ -12676,6 +13162,7 @@ class MacroApp(tk.Tk):
                   start_nested_parent_index: int | None = None,
                   start_nested_action_index: int = 0,
                   start_nested_path: list[int] | None = None,
+                  action_override: Action | None = None,
                   request_token: int | None = None,
                   target_panel: str | None = None) -> None:
         # A lista visível já traz o estado de conexão mais recente. Esperar
@@ -12708,7 +13195,7 @@ class MacroApp(tk.Tk):
                                start_inside_special_group=start_inside_special_group,
                                start_nested_parent_index=start_nested_parent_index,
                                start_nested_action_index=start_nested_action_index,
-                               start_nested_path=start_nested_path, request_token=request_token,
+                               start_nested_path=start_nested_path, action_override=action_override, request_token=request_token,
                                target_panel=target_panel)
             self.refresh_devices(after_refresh=continue_after_refresh, fast=True)
             # Proteção contra uma consulta ADB que fique pendente no Windows:
@@ -12748,7 +13235,7 @@ class MacroApp(tk.Tk):
             messagebox.showwarning("Execução", "Conecte e autorize ao menos um telefone para executar.")
             return
         try:
-            delay_v, pos_v, end_pos_v, speed_v = (float(self.delay_jitter.get()) / 100,
+            delay_v, pos_v, end_pos_v, speed_v = (float(self.delay_jitter_up.get()) / 100,
                                                    int(self.position_jitter.get()),
                                                    int(self.end_position_jitter.get()),
                                                    float(self.speed_jitter.get()) / 100)
@@ -12771,6 +13258,8 @@ class MacroApp(tk.Tk):
                                        start_nested_action_index=start_nested_action_index,
                                        start_nested_path=start_nested_path)
                 candidate_actions = found[0] if found else []
+                if action_override is not None:
+                    candidate_actions = [copy.deepcopy(action_override)]
                 if start_group_index is None and debug_group_name is None:
                     candidate_actions = candidate_actions[start_index:]
                 if found and candidate_actions:
@@ -12810,20 +13299,22 @@ class MacroApp(tk.Tk):
             self._run_thread_context.panel = panel
             self._run_thread_context.run = panel_run
             self._run_thread_context.serial = str(target["serial"])
+            ADB_PROCESS_CONTEXT.run = panel_run
             adb = Adb()
             adb.path = self.adb.path
             adb.serial = target["serial"]
             # Permite interromper imediatamente uma recuperação de XML que
             # esteja aguardando o uiautomator do aparelho voltar a responder.
             adb.xml_stop_event = self.run_stop_event
-            adb.xml_recovery_callback = lambda state, tries: self.events.put((
-                "status",
-                ("XML temporariamente indisponível; recuperando sem avançar o fluxo."
-                 if state == "waiting"
-                 else (f"XML ainda indisponível; limpeza forçada e nova tentativa ({tries})."
-                       if state == "retrying"
-                       else f"XML recuperado após {tries} tentativa(s); retomando a etapa atual.")),
-            ))
+            def report_xml_recovery(state, tries) -> None:
+                if state == "retrying":
+                    return
+                message = ("XML temporariamente indisponível; aguardando a leitura voltar."
+                           if state == "waiting"
+                           else f"XML recuperado após {tries} tentativa(s); retomando a etapa atual.")
+                self.events.put(("status", message))
+
+            adb.xml_recovery_callback = report_xml_recovery
 
             def navigation_xml(nav_name: str) -> tuple[str, bool]:
                 """Lê XML para os ciclos Nav sem deixá-los presos para sempre.
@@ -12844,6 +13335,21 @@ class MacroApp(tk.Tk):
                 except (OSError, subprocess.SubprocessError, RuntimeError):
                     pass
                 self.events.put(("status", f"{nav_name}: XML indisponível; executando somente o arrasto neste ciclo."))
+                return "", True
+
+            def regular_xml(action: Action, context: str) -> tuple[str, bool]:
+                """Captura XML comum sem bloquear a contingência configurada."""
+                try:
+                    xml = adb.ui_xml(timeout=4, force_root_recovery=False)
+                    if xml and "<" in xml:
+                        return xml, False
+                except (OSError, subprocess.SubprocessError, RuntimeError):
+                    pass
+                if action.xml_unavailable_tap_x is not None and action.xml_unavailable_tap_y is not None:
+                    x = max(0, min(target_screen[0] - 1, int(action.xml_unavailable_tap_x)))
+                    y = max(0, min(target_screen[1] - 1, int(action.xml_unavailable_tap_y)))
+                    self.events.put(("status", f"{context}: XML indisponível; executando toque de contingência."))
+                    adb.command("shell", "input", "tap", str(x), str(y))
                 return "", True
             code_capture_stop = threading.Event()
             smspool_capture_stop = threading.Event()
@@ -13104,6 +13610,12 @@ class MacroApp(tk.Tk):
 
                     with pc_automation_lock:
                         action_description = "capturando o link copiado" if copy_link_to_phone else f"digitando {source}"
+                        self.events.put(("pc_automation_escape", (job_panel, current_serial, True)))
+                        notice_done = threading.Event()
+                        self.events.put(("pc_automation_notice", (action_description, notice_done)))
+                        while not notice_done.wait(0.1):
+                            if self.run_stop_event.is_set():
+                                return
                         self.events.put(("status", f"Automação PC: executando {len(clicks)} clique(s) e {action_description}."))
                         link_was_typed = False
                         for step in clicks:
@@ -13148,6 +13660,8 @@ class MacroApp(tk.Tk):
                             self._type_copied_link(adb, copied_link)
                             self.events.put(("status", "Automação PC: link copiado enviado para o celular."))
                         self.events.put(("status", "Automação PC concluída."))
+
+                    self.events.put(("pc_automation_escape", (job_panel, current_serial, False)))
 
                 def mark_running(group_index: int | None, action_index: int | None = None,
                                  tree_item: str | None = None) -> None:
@@ -13315,12 +13829,11 @@ class MacroApp(tk.Tk):
                         mark_running(tree_group_index, tree_action_index, branch.tree_item)
                         label = branch.label or {"tap": "Toque", "swipe": "Arrasto", "key": "Tecla", "training_random_username": "Usuário aleatório treino", "random_wait": "Espera aleatória"}.get(branch.kind, branch.kind)
                         # O andamento da etapa aparece diretamente na árvore.
-                        branch_delay_variation = ((branch.delay_variation_pct or 0) / 100
-                                                  if branch.use_variation else 0)
+                        branch_delay_down_ms, branch_delay_up_ms = self._delay_variation_offsets(branch)
                         branch_delay = max(
                             minimum_delay,
                             max(0, branch.delay_ms * random.uniform(
-                                1 - branch_delay_variation, 1 + branch_delay_variation,
+                            max(0, branch.delay_ms - branch_delay_down_ms), branch.delay_ms + branch_delay_up_ms,
                             )),
                         )
                         if self.run_stop_event.wait(branch_delay / 1000): return False
@@ -13571,14 +14084,14 @@ class MacroApp(tk.Tk):
                         elif branch.kind == "key":
                             adb.command("shell", "input", "keyevent", branch.keycode or "KEYCODE_BACK")
                         elif branch.kind == "xml_tap":
-                            current_xml = adb.try_ui_xml()
+                            current_xml, xml_unavailable = regular_xml(branch, context)
                             position = self._xml_bounds(current_xml, branch) if current_xml else None
                             if position:
                                 mark_live_xml(current_xml, branch)
                                 tap_x = max(0, min(target_screen[0] - 1, position[0] + branch_dx))
                                 tap_y = max(0, min(target_screen[1] - 1, position[1] + branch_dy))
                                 adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
-                            elif nav_rc_context is not None:
+                            elif nav_rc_context is not None and not xml_unavailable:
                                 self.events.put(("status", "Nav-R-C: toque XML não encontrado; voltando ao Nav-R normal."))
                                 return False
                         elif branch.kind == "xml_logic":
@@ -13970,20 +14483,30 @@ class MacroApp(tk.Tk):
                             provider_id = branch.sms_provider_id or runtime_variables.get("NUMBER_API_PROVIDER_ID")
                             order_id = runtime_variables.get("NUMBER_API_ORDER_ID") or runtime_variables.require("SMSPOOL_ORDER_ID")
                             try:
-                                _profile, code = self._wait_number_code(provider_id, str(order_id), branch.timeout_s, SMSPoolCaptureCancel())
+                                _profile, code = self._check_number_code_once(provider_id, str(order_id))
                             except RuntimeError as error:
+                                if self.run_stop_event.is_set():
+                                    return False
                                 parent_actions = immediate_parent_actions(raw_actions, branch)
                                 failure_group = next((candidate for candidate in parent_actions
                                                       if candidate.kind == "number_code_failure_group"), None)
-                                if failure_group is None or self.run_stop_event.is_set():
-                                    raise
-                                self.events.put(("status", f"{context}: código não chegou ({error}); executando a rota de recuperação."))
+                                if failure_group is None:
+                                    parent_actions = immediate_parent_actions(actions, branch)
+                                    failure_group = next((candidate for candidate in parent_actions
+                                                          if candidate.kind == "number_code_failure_group"), None)
+                                if failure_group is None:
+                                    self.events.put(("log", f"{context}: código SMS não chegou ({error}); não há rota ‘Código não chegou’; seguindo o fluxo."))
+                                    continue
+                                if failure_group.restart_parent_actions:
+                                    parent_actions = failure_group.restart_parent_actions
+                                self.events.put(("log", f"{context}: código não chegou para o pedido atual {order_id}; executando ‘Código não chegou’."))
                                 restart_parent_requested[0] = False
-                                if not run_branch(failure_group.branch_actions, f"{context}: código não chegou",
+                                if not run_branch(failure_group.branch_actions, f"{context}: Código não chegou",
                                                   tree_group_index=branch.flow_group):
                                     return False
                                 if not restart_parent_requested[0]:
                                     raise RuntimeError("A rota ‘Código não chegou’ precisa terminar com ‘Reiniciar grupo pai’.") from error
+                                self.events.put(("log", f"{context}: reiniciando o grupo pai com o número/pedido atual."))
                                 if not run_branch(parent_actions, f"{context}: nova tentativa", tree_group_index=branch.flow_group):
                                     return False
                                 continue
@@ -14103,9 +14626,9 @@ class MacroApp(tk.Tk):
                                             break
                                         completed_rounds += 1
                                         missing_attempts = 0
-                                        retry_wait = XML_RETRY_INTERVAL_S * random.uniform(
-                                            1 - branch_delay_variation, 1 + branch_delay_variation,
-                                        )
+                                        retry_wait = random.uniform(
+                                            max(0, XML_RETRY_INTERVAL_S * 1000 - branch_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + branch_delay_up_ms,
+                                        ) / 1000
                                         if completed_rounds < max_rounds and self.run_stop_event.wait(max(0, retry_wait)):
                                             break
                                         continue
@@ -14125,9 +14648,9 @@ class MacroApp(tk.Tk):
                                     if missing_attempts >= 3:
                                         self.events.put(("status", f"{context}: nenhum XML da etapa ‘{branch.label or 'clicar qualquer'}’ foi encontrado após 3 tentativas; seguindo o fluxo."))
                                         break
-                                    retry_wait = XML_RETRY_INTERVAL_S * random.uniform(
-                                        1 - branch_delay_variation, 1 + branch_delay_variation,
-                                    )
+                                    retry_wait = random.uniform(
+                                        max(0, XML_RETRY_INTERVAL_S * 1000 - branch_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + branch_delay_up_ms,
+                                    ) / 1000
                                     self.events.put(("status", f"{context}: nenhum XML encontrado; nova tentativa {missing_attempts + 1}/3."))
                                     if self.run_stop_event.wait(max(0, retry_wait)):
                                         break
@@ -14139,9 +14662,9 @@ class MacroApp(tk.Tk):
                                 adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
                                 completed_rounds += 1
                                 missing_attempts = 0
-                                retry_wait = XML_RETRY_INTERVAL_S * random.uniform(
-                                    1 - branch_delay_variation, 1 + branch_delay_variation,
-                                )
+                                retry_wait = random.uniform(
+                                    max(0, XML_RETRY_INTERVAL_S * 1000 - branch_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + branch_delay_up_ms,
+                                ) / 1000
                                 if completed_rounds < max_rounds and self.run_stop_event.wait(max(0, retry_wait)):
                                     break
                         elif branch.kind == "birthdate":
@@ -14192,13 +14715,13 @@ class MacroApp(tk.Tk):
                             skipped_completed = shared["completed"]
                         self.events.put(("progress", (skipped_completed, total_steps)))
                         continue
-                    action_delay_v = ((action.delay_variation_pct or 0) / 100) if action.use_variation else 0
+                    action_delay_down_ms, action_delay_up_ms = self._delay_variation_offsets(action)
                     action_pos_v = (action.position_variation_px or 0) if action.use_variation else 0
                     action_end_pos_v = ((action.end_position_variation_px if action.end_position_variation_px is not None else action_pos_v)
                                         if action.use_variation else 0)
                     action_speed_v = ((action.speed_variation_pct or 0) / 100) if action.use_variation else 0
-                    recorded_delay = max(0, action.delay_ms * random.uniform(1 - action_delay_v, 1 + action_delay_v))
-                    delay = max(minimum_delay, recorded_delay)
+                    recorded_delay = random.uniform(max(0, action.delay_ms - action_delay_down_ms), action.delay_ms + action_delay_up_ms)
+                    delay = 0 if action.run_immediately else max(minimum_delay, recorded_delay)
                     # Mostra a próxima etapa já durante a espera dela; assim a
                     # árvore não parece travada enquanto o atraso está correndo.
                     mark_running(action.flow_group, action.flow_action_index, action.tree_item)
@@ -14696,20 +15219,26 @@ class MacroApp(tk.Tk):
                         provider_name = self._number_api_name(provider_id)
                         self.events.put(("status", f"{provider_name}: aguardando o código no telefone {target_no}."))
                         try:
-                            _profile, code = self._wait_number_code(provider_id, str(order_id), action.timeout_s, SMSPoolCaptureCancel())
+                            _profile, code = self._check_number_code_once(provider_id, str(order_id))
                         except RuntimeError as error:
+                            if self.run_stop_event.is_set():
+                                break
                             parent_actions = immediate_parent_actions(actions, action)
                             failure_group = next((candidate for candidate in parent_actions
                                                   if candidate.kind == "number_code_failure_group"), None)
-                            if failure_group is None or self.run_stop_event.is_set():
-                                raise
-                            self.events.put(("status", f"{provider_name}: código não chegou ({error}); executando a rota de recuperação."))
+                            if failure_group is None:
+                                self.events.put(("log", f"{provider_name}: código SMS não chegou ({error}); não há rota ‘Código não chegou’; seguindo o fluxo."))
+                                continue
+                            if failure_group.restart_parent_actions:
+                                parent_actions = failure_group.restart_parent_actions
+                            self.events.put(("log", f"{provider_name}: código não chegou para o pedido atual {order_id}; executando ‘Código não chegou’."))
                             restart_parent_requested[0] = False
                             if not run_branch(failure_group.branch_actions, "Código não chegou",
                                               tree_group_index=action.flow_group):
                                 break
                             if not restart_parent_requested[0]:
                                 raise RuntimeError("A rota ‘Código não chegou’ precisa terminar com ‘Reiniciar grupo pai’.") from error
+                            self.events.put(("log", f"{provider_name}: reiniciando o grupo pai com o número/pedido atual."))
                             if not run_branch(parent_actions, f"Grupo {int(action.flow_group or 0) + 1}: nova tentativa", tree_group_index=action.flow_group):
                                 break
                             continue
@@ -14829,7 +15358,7 @@ class MacroApp(tk.Tk):
                                         self.events.put(("status", f"{action.label or 'XML clicar'}: rota especial terminou antes do fim; continuando as verificaÃ§Ãµes XML."))
                                     completed_rounds += 1
                                     missing_attempts = 0
-                                    retry_wait = XML_RETRY_INTERVAL_S * random.uniform(1 - action_delay_v, 1 + action_delay_v)
+                                    retry_wait = random.uniform(max(0, XML_RETRY_INTERVAL_S * 1000 - action_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + action_delay_up_ms) / 1000
                                     if completed_rounds < max_rounds and self.run_stop_event.wait(max(0, retry_wait)):
                                         break
                                     continue
@@ -14849,7 +15378,7 @@ class MacroApp(tk.Tk):
                                     found_position = None
                                     completed_rounds += 1
                                     missing_attempts = 0
-                                    retry_wait = XML_RETRY_INTERVAL_S * random.uniform(1 - action_delay_v, 1 + action_delay_v)
+                                    retry_wait = random.uniform(max(0, XML_RETRY_INTERVAL_S * 1000 - action_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + action_delay_up_ms) / 1000
                                     if completed_rounds < max_rounds and self.run_stop_event.wait(max(0, retry_wait)):
                                         break
                                     continue
@@ -14859,7 +15388,7 @@ class MacroApp(tk.Tk):
                                 if missing_attempts >= 3:
                                     self.events.put(("status", f"{action.label or 'XML clicar'}: nenhum dos {len(candidates)} XMLs foi encontrado após 3 tentativas; seguindo o fluxo."))
                                     break
-                                retry_wait = XML_RETRY_INTERVAL_S * random.uniform(1 - action_delay_v, 1 + action_delay_v)
+                                retry_wait = random.uniform(max(0, XML_RETRY_INTERVAL_S * 1000 - action_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + action_delay_up_ms) / 1000
                                 self.events.put(("status", f"{action.label or 'XML clicar'}: nenhum XML encontrado; nova tentativa {missing_attempts + 1}/3."))
                                 if self.run_stop_event.wait(max(0, retry_wait)):
                                     break
@@ -14882,8 +15411,11 @@ class MacroApp(tk.Tk):
                         end_at = time.monotonic() + action.timeout_s
                         position = None
                         current_xml = ""
+                        xml_unavailable = False
                         while time.monotonic() < end_at and not self.run_stop_event.is_set():
-                            current_xml = adb.try_ui_xml()
+                            current_xml, xml_unavailable = regular_xml(action, "XML")
+                            if xml_unavailable:
+                                break
                             position = self._xml_bounds(current_xml, action) if current_xml else None
                             if position:
                                 mark_live_xml(current_xml, action)
@@ -14893,7 +15425,7 @@ class MacroApp(tk.Tk):
                             tap_x = max(0, min(target_screen[0] - 1, position[0] + random.randint(-action_pos_v, action_pos_v)))
                             tap_y = max(0, min(target_screen[1] - 1, position[1] + random.randint(-action_pos_v, action_pos_v)))
                             adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
-                        elif not self.run_stop_event.is_set():
+                        elif not self.run_stop_event.is_set() and not xml_unavailable:
                             self.events.put(("status", f"XML não encontrou ‘{action.selector_value}’; etapa ignorada."))
                     elif action.kind == "xml_logic":
                         end_at = time.monotonic() + action.timeout_s
@@ -15124,9 +15656,12 @@ class MacroApp(tk.Tk):
                         if not first_tap:
                             self.events.put(("log", "Nav-S: interrompido — falta gravar o toque inicial."))
                             raise RuntimeError(f"{action.label or 'Nav-S'} precisa de 1 toque gravado para a chance de curtir.")
-                        if len(xml_validations) >= 2 and not recorded_swipe:
-                            self.events.put(("log", "Nav-S: interrompido — há XML posterior, mas falta o arrasto de saída."))
-                            raise RuntimeError(f"{action.label or 'Nav-S'} precisa de 1 arrasto gravado para a segunda validação XML e as seguintes.")
+                        # O arrasto também é a contingência quando o XML fica
+                        # indisponível; portanto ele é obrigatório mesmo que
+                        # exista apenas uma validação XML.
+                        if not recorded_swipe:
+                            self.events.put(("log", "Nav-S: interrompido — falta gravar o arrasto de contingência."))
+                            raise RuntimeError(f"{action.label or 'Nav-S'} precisa de 1 arrasto gravado para os XMLs posteriores e para XML indisponível.")
                         end_at = time.monotonic() + random.uniform(action.nav_min_s, action.nav_max_s)
                         self.events.put(("status", f"Nav-S: início — até {action.nav_s_verify_timeout_s:g}s por verificação, {len(xml_validations)} XML(s), "
                                                    f"toque inicial {action.nav_first_tap_chance_pct:g}%, duração total {action.nav_min_s:g}–{action.nav_max_s:g}s."))
@@ -15139,7 +15674,6 @@ class MacroApp(tk.Tk):
                             mark_running(action.flow_group, configured.index(xml_validations[0]), xml_validations[0].tree_item)
                             verification_end = min(end_at, time.monotonic() + action.nav_s_verify_timeout_s)
                             found_action = False
-                            continue_normal_flow = False
                             xml_unavailable = False
                             while time.monotonic() < verification_end and not self.run_stop_event.is_set():
                                 current_xml, xml_unavailable = navigation_xml("Nav-S")
@@ -15188,13 +15722,10 @@ class MacroApp(tk.Tk):
                                         mark_running(action.flow_group, configured.index(first_tap), first_tap.tree_item)
                                         adb.command("shell", "input", "tap", str(tx), str(ty))
                                     else:
-                                        continue_normal_flow = True
-                                        self.events.put(("status", f"Nav-S: ciclo {cycle} — XML principal '{xml_validations[0].selector_value or 'sem texto'}' encontrado, mas a chance do toque falhou; seguindo o fluxo normal."))
+                                        self.events.put(("status", f"Nav-S: ciclo {cycle} — XML principal '{xml_validations[0].selector_value or 'sem texto'}' encontrado, mas a chance do toque falhou; mantendo o Nav-S até a rota alternativa."))
                                     break
                                 self.run_stop_event.wait(min(XML_RETRY_INTERVAL_S, max(0, verification_end - time.monotonic())))
                             if self.run_stop_event.is_set():
-                                break
-                            if continue_normal_flow:
                                 break
                             if xml_unavailable:
                                 variation = max(0, action.nav_position_variation_px)
@@ -15233,15 +15764,18 @@ class MacroApp(tk.Tk):
                                 final_xml = adb.try_ui_xml()
                                 final_positions = self._xml_bounds_many(final_xml, xml_validations) if final_xml else []
                                 if any(final_positions):
+                                    found_once = True
                                     variation = max(0, action.nav_position_variation_px)
                                     tx = max(0, min(target_screen[0] - 1, final_tap.x + random.randint(-variation, variation)))
                                     ty = max(0, min(target_screen[1] - 1, final_tap.y + random.randint(-variation, variation)))
                                     self.events.put(("status", "Nav-S: XML encontrado na última verificação; executando toque final."))
                                     mark_running(action.flow_group, configured.index(final_tap), final_tap.tree_item)
                                     adb.command("shell", "input", "tap", str(tx), str(ty))
-                            if action.nav_after_actions:
-                                self.events.put(("status", "Nav-S: tempo total encerrado; executando rota alternativa."))
+                            if action.nav_after_actions and found_once:
+                                self.events.put(("status", "Nav-S: XML encontrado; tempo total encerrado, executando rota alternativa."))
                                 run_branch(action.nav_after_actions, "Nav-S: rota alternativa após o tempo total")
+                            elif action.nav_after_actions:
+                                self.events.put(("status", "Nav-S: nenhum XML foi encontrado; seguindo sem executar a rota alternativa."))
                     elif action.kind == "key":
                         adb.command("shell", "input", "keyevent", action.keycode or "KEYCODE_BACK")
                     elif action.kind == "tap":
@@ -15262,7 +15796,11 @@ class MacroApp(tk.Tk):
                     self.events.put(("progress", (completed, total_steps)))
                     # Progresso visual é mostrado pela seleção da etapa na árvore.
             except Exception as error:
-                self.events.put(("error", str(error)))
+                # Encerrar ADB durante um Esc devolve código de erro ao
+                # processo que estava em curso. Isso é cancelamento esperado,
+                # não uma falha que deva abrir popup nem exigir outro Esc.
+                if not panel_run.stop_event.is_set():
+                    self.events.put(("error", str(error)))
             finally:
                 code_capture_stop.set()
                 if self.run_stop_event.is_set():
@@ -15957,30 +16495,35 @@ class MacroApp(tk.Tk):
         if action_index < 0 or action_index >= len(actions):
             return "break"
         action = actions[action_index]
-        delay = action.delay_variation_pct if action.delay_variation_pct is not None else 0
+        legacy_delay = max(0, action.delay_ms * float(action.delay_variation_pct or 0) / 100)
+        delay_down = action.delay_variation_min_ms if action.delay_variation_min_ms is not None else legacy_delay
+        delay_up = action.delay_variation_max_ms if action.delay_variation_max_ms is not None else legacy_delay
         position = action.position_variation_px if action.position_variation_px is not None else 0
         end_position = (action.end_position_variation_px
                         if action.end_position_variation_px is not None
                         else position)
         speed = action.speed_variation_pct if action.speed_variation_pct is not None else 0
         value = simpledialog.askstring(
-            "Ajustar variação", "Pausa %, toque/início px, fim do arrasto px, duração %:",
-            initialvalue=f"{delay}, {position}, {end_position}, {speed}", parent=self
+            "Ajustar variação", "Reduzir pausa ms, aumentar pausa ms, toque/início px, fim do arrasto px, duração %:",
+            initialvalue=f"{delay_down:g}, {delay_up:g}, {position}, {end_position}, {speed}", parent=self
         )
         if value is None:
             return "break"
         try:
-            delay_text, position_text, end_position_text, speed_text = (part.strip() for part in value.split(","))
-            new_delay = max(0, float(delay_text))
+            delay_down_text, delay_up_text, position_text, end_position_text, speed_text = (part.strip() for part in value.split(","))
+            new_delay_down = max(0, float(delay_down_text))
+            new_delay_up = max(0, float(delay_up_text))
             new_position = max(0, int(position_text))
             new_end_position = max(0, int(end_position_text))
             new_speed = max(0, float(speed_text))
         except (ValueError, TypeError):
-            messagebox.showwarning("Variação", "Use quatro valores: pausa %, toque/início px, fim do arrasto px, duração %.")
+            messagebox.showwarning("Variação", "Use cinco valores: reduzir pausa ms, aumentar pausa ms, toque/início px, fim do arrasto px, duração %.")
             return "break"
         self.push_undo()
         action.use_variation = True
-        action.delay_variation_pct = new_delay
+        action.delay_variation_min_ms = new_delay_down
+        action.delay_variation_max_ms = new_delay_up
+        action.delay_variation_pct = None
         action.position_variation_px = new_position
         action.end_position_variation_px = new_end_position
         action.speed_variation_pct = new_speed
@@ -16002,7 +16545,7 @@ class MacroApp(tk.Tk):
                 continue
             action = location[1][location[2]]
             action.use_variation = not action.use_variation
-            if action.use_variation and all(value is None for value in (action.delay_variation_pct, action.position_variation_px, action.end_position_variation_px, action.speed_variation_pct)):
+            if action.use_variation and all(value is None for value in (action.delay_variation_min_ms, action.delay_variation_max_ms, action.delay_variation_pct, action.position_variation_px, action.end_position_variation_px, action.speed_variation_pct)):
                 self._set_action_variation_defaults(action, force_enabled=True)
         self.refresh_tree()
         restored = [item for item in selected if self.tree.exists(item)]
@@ -16129,9 +16672,12 @@ class MacroApp(tk.Tk):
     def edit_delay_cell(self, event):
         """Um clique na coluna Espera abre a edição daquela única etapa."""
         item = self.tree.identify_row(event.y)
-        if self.tree.identify_column(event.x) != "#5":
+        column = self.tree.identify_column(event.x)
+        if column not in ("#4", "#5"):
             return
         if item.startswith("g:"):
+            if column != "#5":
+                return
             group = self.macros[self.flow_var.get()][int(item.split(":")[1])]
             if not group.get("navigation_s"):
                 return
@@ -16304,6 +16850,24 @@ class MacroApp(tk.Tk):
             action_insert = len(groups[target_group]["actions"])
         if target_actions is None:
             target_actions = groups[target_group]["actions"]
+
+        # Um grupo especial é um controlador de raiz com configuração própria
+        # (Loop XML, validação, XML condicional, Nav-R/Nav-S etc.). Transformá-
+        # lo em ``subgroup`` ao colar dentro de outro item apaga essa semântica.
+        # Nesses casos ele é inserido como grupo de raiz completo, preservando
+        # todos os campos originais por deep-copy.
+        special_group_flags = (
+            "xml_logic_group", "xml_any_tap_group", "xml_restart_loop_group",
+            "navigation_r", "navigation_s", "navigation_rc", "training_loop",
+            "validation_loop", "branch_only", "schedule_divider_group",
+        )
+        copied_special_group = any(
+            kind == "group" and isinstance(item, dict)
+            and any(bool(item.get(flag)) for flag in special_group_flags)
+            for kind, item in self.macro_clipboard
+        )
+        if paste_groups_as_children and copied_special_group:
+            paste_groups_as_children = False
 
         self.push_undo()
         last_item: str | None = None
@@ -16595,6 +17159,42 @@ class MacroApp(tk.Tk):
                 event_serial: str | None = None
                 if isinstance(data, PanelEvent):
                     event_panel, event_serial, data = data.panel, data.serial, data.payload
+                if kind == "pc_automation_notice":
+                    description, release = data
+                    notice = tk.Toplevel(self)
+                    notice.title("Automação no PC")
+                    notice.configure(bg="#171b26")
+                    notice.resizable(False, False)
+                    notice.attributes("-topmost", True)
+                    tk.Label(notice, text="Automação no PC em 10 segundos", bg="#171b26", fg="#f8fafc",
+                             font=("Segoe UI Semibold", 13)).pack(padx=22, pady=(18, 6))
+                    tk.Label(notice, text=str(description), bg="#171b26", fg="#aebbd0",
+                             font=("Segoe UI", 10), wraplength=360).pack(padx=22, pady=(0, 16))
+                    notice.update_idletasks()
+                    # Janela independente, centralizada na tela: não fica
+                    # dentro nem depende da posição do app.
+                    user32 = ctypes.windll.user32
+                    screen_w = int(user32.GetSystemMetrics(0))
+                    screen_h = int(user32.GetSystemMetrics(1))
+                    x = max(0, (screen_w - notice.winfo_width()) // 2)
+                    y = max(0, (screen_h - notice.winfo_height()) // 2)
+                    notice.geometry(f"+{x}+{y}")
+                    user32.MessageBeep(0x00000040)  # MB_ICONINFORMATION
+                    def close_notice():
+                        try:
+                            if notice.winfo_exists():
+                                notice.destroy()
+                        finally:
+                            release.set()
+                    notice.after(10000, close_notice)
+                    continue
+                if kind == "pc_automation_escape":
+                    target_panel, target_serial, active = data
+                    if active:
+                        self.pc_automation_escape_target = (str(target_panel), str(target_serial))
+                    elif self.pc_automation_escape_target == (str(target_panel), str(target_serial)):
+                        self.pc_automation_escape_target = None
+                    continue
                 if kind == "live_screen_size":
                     session, serial, screen = data
                     if session == self.live_view_session and str(serial) == str(self.scrcpy_serial):
@@ -16866,18 +17466,25 @@ class MacroApp(tk.Tk):
                         self.progress_value.set(percent)
                         self.progress_text.set(f"{done}/{total} etapas — {percent}%")
                 elif kind == "running":
+                    if event_panel and event_panel not in self.panel_runs:
+                        continue
                     if event_panel in (None, self.flow_var.get()):
                         serial = self._execution_state_serial()
                         self._pending_running_items[serial] = self.tree_item_for_action(data) if data is not None else None
                 elif kind == "running_item":
+                    if event_panel and event_panel not in self.panel_runs:
+                        continue
                     serial, item = data if isinstance(data, tuple) else (None, data)
                     # A grade exibe telefones de painéis/modelos diferentes ao
                     # mesmo tempo. Não descarte a etapa do outro cartão só
                     # porque o editor principal está em um painel distinto.
                     self._pending_running_items[str(serial or self._execution_state_serial())] = item
                 elif kind == "execution_device_finished":
+                    self._pending_running_items.pop(str(data), None)
                     state = self.device_execution_states.get(str(data))
                     if state:
+                        self._collapse_finished_grid_containers(str(data), state.get("running"))
+                        self._collapse_finished_main_containers(state.get("running"))
                         state["running"] = None
                     self._render_grid_running_step(str(data), None)
                     if not getattr(self, "app_view_var", None) or self.app_view_var.get() != "celulares":
