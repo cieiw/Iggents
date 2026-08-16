@@ -27,6 +27,12 @@ PASSWORD_FORMULA = (
     "3 primeiras letras do sobrenome invertidas (duas vezes) + "
     "quantidade de letras do nome"
 )
+IDENTITY_MEDIA_TYPES = ("perfil", "verificacao")
+FIXED_IDENTITY_MEDIA_TYPES = ("story",)
+IDENTITY_MEDIA_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif",
+    ".mp4", ".mov", ".mkv", ".webm", ".3gp", ".avi", ".m4v",
+}
 
 
 def _read_list(path: Path) -> list[str]:
@@ -66,8 +72,125 @@ def save_name_profiles(profiles: list[dict[str, object]]) -> None:
     NAMES_DATA_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _names_data() -> dict[str, object]:
+    if not NAMES_DATA_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(NAMES_DATA_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("O arquivo nomes.json está inválido.") from exc
+
+
+def load_identity_links() -> list[str]:
+    """Links gerais, sem associação a nome, sobrenome ou celular."""
+    data = _names_data()
+    values = data.get("links_identidade", [])
+    # Migra sem perda os links antigos que estavam presos aos nomes.
+    if not values and "links_identidade" not in data:
+        values = [link for item in data.get("nomes", []) if isinstance(item, dict)
+                  for link in (item.get("links", []) if isinstance(item.get("links", []), list) else [])]
+    if isinstance(values, str):
+        values = values.splitlines()
+    if not isinstance(values, list):
+        raise RuntimeError("Os links das identidades devem formar uma lista.")
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def save_identity_links(links: list[str]) -> None:
+    data = _names_data()
+    data.setdefault("nomes", [])
+    data.setdefault("personagens", [])
+    data["links_identidade"] = list(dict.fromkeys(str(link).strip() for link in links if str(link).strip()))
+    NAMES_DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _surname_prefix(value: str) -> str:
+    normalized = "".join(char for char in unicodedata.normalize("NFKD", str(value).strip().casefold())
+                         if not unicodedata.combining(char))
+    return re.sub(r"[^a-z]", "", normalized)[:3]
+
+
+def load_last_names() -> list[str]:
+    values = _read_list(LISTS_DIR / "sobrenomes.txt")
+    validate_last_names(values)
+    return values
+
+
+def validate_last_names(values: list[str]) -> list[str]:
+    """Recusa sobrenomes com o mesmo prefixo de três letras para proteger o @."""
+    result = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+    seen: dict[str, str] = {}
+    for name in result:
+        prefix = _surname_prefix(name)
+        if len(prefix) < 3:
+            raise ValueError(f"O sobrenome '{name}' precisa ter ao menos 3 letras.")
+        previous = seen.get(prefix)
+        if previous and previous.casefold() != name.casefold():
+            raise ValueError(f"'{name}' conflita com '{previous}': ambos começam com '{prefix}'.")
+        seen[prefix] = name
+    if not result:
+        raise ValueError("Mantenha ao menos um sobrenome.")
+    return result
+
+
+def save_last_names(values: list[str]) -> None:
+    normalized = validate_last_names(values)
+    (LISTS_DIR / "sobrenomes.txt").write_text("\n".join(normalized) + "\n", encoding="utf-8")
+
+
 def random_name_profile() -> dict[str, object]:
     return random.choice(load_name_profiles())
+
+
+def identity_media_folders(root_value: str | Path) -> list[Path]:
+    """Lista as pastas ``identidadeN`` disponíveis na pasta configurada."""
+    root = Path(root_value).expanduser()
+    if not root.is_dir():
+        raise RuntimeError("Configure uma pasta de identidades existente.")
+    folders = [
+        path for path in root.iterdir()
+        if path.is_dir() and path.name.casefold() not in FIXED_IDENTITY_MEDIA_TYPES
+        and (path / "perfil").is_dir() and (path / "verificacao").is_dir()
+    ]
+    if not folders:
+        raise RuntimeError("A pasta de identidades não possui uma identidade com as subpastas perfil e verificacao.")
+    return sorted(folders, key=lambda path: path.name.casefold())
+
+
+def random_identity_media_folder(root_value: str | Path) -> Path:
+    """Sorteia uma identidade sem reservar nem gravar vínculo permanente."""
+    return random.choice(identity_media_folders(root_value))
+
+
+def random_identity_media(identity_folder: str | Path, media_type: str) -> Path:
+    """Sorteia uma mídia de perfil/verificacao da identidade temporária."""
+    normalized_type = str(media_type or "").strip().casefold()
+    if normalized_type not in IDENTITY_MEDIA_TYPES:
+        raise ValueError("Tipo de mídia da identidade inválido.")
+    folder = Path(identity_folder).expanduser() / normalized_type
+    if not folder.is_dir():
+        raise RuntimeError(f"A identidade {Path(identity_folder).name} não possui a pasta {normalized_type}.")
+    files = [path for path in folder.iterdir()
+             if path.is_file() and path.suffix.casefold() in IDENTITY_MEDIA_EXTENSIONS]
+    if not files:
+        raise RuntimeError(f"A pasta {normalized_type} da identidade {Path(identity_folder).name} não possui mídias.")
+    return random.choice(files)
+
+
+def random_fixed_identity_media(root_value: str | Path, media_type: str) -> Path:
+    """Sorteia mídia de uma pasta compartilhada, como identidades/story."""
+    normalized_type = str(media_type or "").strip().casefold()
+    if normalized_type not in FIXED_IDENTITY_MEDIA_TYPES:
+        raise ValueError("Tipo de mídia fixa inválido.")
+    folder = Path(root_value).expanduser() / normalized_type
+    if not folder.is_dir():
+        raise RuntimeError(f"A pasta fixa {normalized_type} não existe dentro de identidades.")
+    files = [path for path in folder.iterdir()
+             if path.is_file() and path.suffix.casefold() in IDENTITY_MEDIA_EXTENSIONS]
+    if not files:
+        raise RuntimeError(f"A pasta fixa {normalized_type} não possui mídias.")
+    return random.choice(files)
 
 
 def _normalize_character(value: object) -> dict[str, object] | None:
@@ -400,7 +523,7 @@ def reserve_email(domain: str = "hotvinci.online", device_serial: str | None = N
         raise ValueError("Informe um domínio válido, por exemplo hotvinci.online.")
 
     first_names = [str(profile["nome"]) for profile in load_name_profiles()]
-    last_names = _read_list(LISTS_DIR / "sobrenomes.txt")
+    last_names = load_last_names()
     if first_name:
         first_names = [first for first in first_names if first == first_name]
         if not first_names:

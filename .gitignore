@@ -1,0 +1,12 @@
+# Artefatos reconstruídos localmente; nunca enviar ao GitHub.
+/build/
+/dist/
+
+# Cache e registros locais.
+__pycache__/
+*.py[cod]
+/runtime/*.log
+/data/browser_profiles/
+
+# Arquivo Android grande baixado localmente.
+Instagram_440.0.0.19.86_APKPure.apk.apk

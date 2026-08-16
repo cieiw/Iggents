@@ -96,3 +96,40 @@ Para ser compatível com nomes de pasta do Windows, seriais de ADB via rede que
 contêm `:` são normalizados e recebem um pequeno sufixo de hash. As variáveis
 continuam vinculadas ao serial original e nunca são compartilhadas entre as
 threads dos aparelhos.
+
+## Reconstruir o executável após baixar o projeto
+
+A pasta `dist/` não é enviada ao GitHub: ela contém o executável gerado e
+bibliotecas muito grandes (por exemplo, Torch e llvmlite), que ultrapassam o
+limite do GitHub. Depois de baixar/clonar o projeto em outro computador, abra
+um terminal na pasta do projeto e execute:
+
+```powershell
+build_windows.bat
+```
+
+Esse comando baixa as dependências necessárias — inclusive `uiautomator2` — e
+recria `dist/iggents/`. Não envie `dist/` nem `build/` ao repositório.
+
+## Mídias das identidades
+
+A pasta padrão fica dentro do projeto, em `identidades/`. Crie as identidades
+seguindo esta estrutura:
+
+```text
+identidades/
+  story/
+  identidade (1)/
+    perfil/
+    verificacao/
+  identidade (2)/
+    perfil/
+    verificacao/
+```
+
+## Navegador para enviar convite
+
+A etapa **Enviar convite** abre um Chrome isolado em
+`data/browser_profiles/enviar_convite/`. Na primeira execução, entre na sua
+conta Meta/Facebook nessa janela. O login permanece somente nesse perfil; ele
+não usa nem altera o Chrome comum ou o perfil do Mimic.

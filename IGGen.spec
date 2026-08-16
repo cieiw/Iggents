@@ -7,7 +7,7 @@ project = Path(SPECPATH)
 optional_datas = []
 optional_binaries = []
 optional_hiddenimports = []
-for package in ('faster_whisper', 'whisper'):
+for package in ('faster_whisper', 'whisper', 'uiautomator2', 'adbutils', 'playwright'):
     try:
         package_datas, package_binaries, package_hiddenimports = collect_all(package)
     except Exception:

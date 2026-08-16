@@ -27,7 +27,9 @@ import sys
 import tarfile
 import threading
 import time
+import traceback
 import uuid
+import urllib.error
 import tkinter as tk
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -38,12 +40,21 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageDraw, ImageTk
+
+try:
+    import uiautomator2 as u2
+except ImportError:
+    u2 = None
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 from tools.audio_capture import capture_device_audio
 from tools.link_title_generator import load_link_titles, random_link_title, save_link_titles
 from tools.random_text_generator import load_random_texts, random_text, save_random_texts
-from tools.name_email_generator import (instagram_username_for, latest_identity_for_device, load_name_profiles, load_random_users, load_random_characters, load_used_identities, next_training_username, random_character_profile, random_name_profile,
+from tools.name_email_generator import (FIXED_IDENTITY_MEDIA_TYPES, IDENTITY_MEDIA_TYPES, identity_media_folders, instagram_username_for, latest_identity_for_device, load_identity_links, load_last_names, load_name_profiles, load_random_users, load_random_characters, load_used_identities, next_training_username, random_character_profile, random_fixed_identity_media, random_identity_media, random_identity_media_folder, random_name_profile,
                                         random_training_username, release_used_identity, reserve_email, reserve_instagram_username, reserve_named_email,
-                                        save_name_profiles, save_random_characters, save_random_users)
+                                        save_identity_links, save_last_names, save_name_profiles, save_random_characters, save_random_users)
 from tools.runtime_variables import RuntimeVariables
 from tools.whisper_engine import extract_verification_code, transcribe_audio
 from tools.zoho_code_reader import release_instagram_code, wait_for_instagram_code
@@ -60,6 +71,24 @@ MACROS_DIR = DATA_DIR / "macros"
 MACROS_DIR.mkdir(parents=True, exist_ok=True)
 VERSIONS_DIR = DATA_DIR / "versoes"
 VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+IDENTITIES_DIR = APP_DIR / "identidades"
+IDENTITIES_DIR.mkdir(parents=True, exist_ok=True)
+BROWSER_PROFILES_DIR = DATA_DIR / "browser_profiles"
+INVITE_BROWSER_PROFILE = BROWSER_PROFILES_DIR / "enviar_convite"
+INVITE_BROWSER_PORT = 9326
+INVITE_URL = "https://developers.facebook.com/apps/1730475298100839/roles/roles/"
+INVITE_SELECTOR_CAPTURES_FILE = DATA_DIR / "browser_selector_captures.json"
+# Duração de cada tentativa individual. Não há mais limite total: enquanto o
+# fluxo estiver ativo, os elementos do convite continuam sendo procurados.
+BROWSER_INVITE_CLICK_TIMEOUT_MS = 3_000
+# Seletores estáveis da tela de convite. Classes ``x...`` do Facebook mudam
+# frequentemente; usamos papel, texto visível e o campo com placeholder.
+INVITE_SELECTORS = {
+    "adicionar_pessoas": '[role="button"]:visible',
+    "testador_instagram": '[role="gridcell"]:visible',
+    "usuario_instagram": 'input[placeholder^="Insira o nome de usuário"]:visible',
+    "confirmar_adicionar": '[role="button"]:visible',
+}
 MEDIA_PROCESSING_DIR = Path(r"C:\Users\cieiw\Desktop\• scripts\• clean")
 PROCESSED_MEDIA_DIR = DATA_DIR / "midias_processadas"
 PROCESSED_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,11 +110,86 @@ FIXED_ACCOUNTS_FILE = DATA_DIR / "contas_fixas.json"
 ADB_KEYBOARD_PACKAGE = "com.android.adbkeyboard"
 ADB_KEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
 XML_RETRY_INTERVAL_S = 0.12
+# Um dump anormalmente grande (geralmente uma WebView presa) pode consumir a
+# memória da interface antes mesmo de a janela "Ver XML" conseguir tratá-lo.
+# Telas normais ficam muito abaixo desse limite.
+MAX_UI_XML_BYTES = 6_000_000
+
+
+def xml_capture_source_label(source: str) -> str:
+    return "uiautomator2" if source == "uiautomator2" else "origem desconhecida"
+
+
 # O uiautomator usa um único canal de acessibilidade por aparelho. Duas
 # capturas simultâneas (por exemplo, uma verificação do fluxo e uma janela de
 # XML aberta) podem deixar o processo Java preso indefinidamente no Samsung.
 _UI_XML_LOCKS: dict[str, threading.Lock] = {}
 _UI_XML_LOCKS_GUARD = threading.Lock()
+
+
+class _AdbSerialGate:
+    """Arbitra chamadas ADB de um único serial por prioridade.
+
+    Não limita os outros aparelhos: cada serial tem sua própria instância.
+    A prioridade 0 é usada para injeção de input, 1 para XML e 2 para tarefas
+    auxiliares, como capturas e manutenção.
+    """
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._active = False
+        self._active_priority = 2
+        self._active_process: subprocess.Popen | None = None
+        self._waiting = [0, 0, 0]
+
+    def acquire(self, priority: int, stop_event: threading.Event | None = None) -> None:
+        priority = max(0, min(2, int(priority)))
+        with self._condition:
+            self._waiting[priority] += 1
+            try:
+                while self._active or any(self._waiting[level] for level in range(priority)):
+                    # A tap/swipe pendente não pode esperar um dump de XML que
+                    # já começou. Cancelamos apenas a tarefa auxiliar deste
+                    # mesmo serial; os outros celulares seguem intocados.
+                    if priority < self._active_priority and self._active_process is not None:
+                        try:
+                            if self._active_process.poll() is None:
+                                self._active_process.terminate()
+                        except OSError:
+                            pass
+                    if stop_event is not None and stop_event.is_set():
+                        raise InterruptedError("Execução interrompida")
+                    self._condition.wait(0.1)
+                self._waiting[priority] -= 1
+                self._active = True
+            except BaseException:
+                self._waiting[priority] -= 1
+                self._condition.notify_all()
+                raise
+
+    def set_active_process(self, process: subprocess.Popen, priority: int) -> None:
+        with self._condition:
+            self._active_process = process
+            self._active_priority = max(0, min(2, int(priority)))
+            self._condition.notify_all()
+
+    def release(self) -> None:
+        with self._condition:
+            self._active = False
+            self._active_process = None
+            self._active_priority = 2
+            self._condition.notify_all()
+
+
+_ADB_SERIAL_GATES: dict[str, _AdbSerialGate] = {}
+_ADB_SERIAL_GATES_GUARD = threading.Lock()
+
+
+def _adb_serial_gate(serial: str) -> _AdbSerialGate | None:
+    serial = str(serial or "")
+    if not serial:
+        return None
+    with _ADB_SERIAL_GATES_GUARD:
+        return _ADB_SERIAL_GATES.setdefault(serial, _AdbSerialGate())
 # Versão de desenvolvimento oficial do ADBKeyBoard, compatível com Android atual.
 # O arquivo só é baixado ao usar o botão de configuração e quando necessário.
 ADB_KEYBOARD_APK_URL = "https://github.com/senzhk/ADBKeyBoard/releases/download/v2.5-dev/keyboardservice-debug.apk"
@@ -114,11 +218,22 @@ class PanelRun:
     total_steps: int = 0
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     active_processes: set[object] = field(default_factory=set, repr=False)
+    # O painel pode executar mais de um celular ao mesmo tempo. Cada processo
+    # ADB tambÃ©m Ã© indexado pelo serial para que parar um cartÃ£o nunca mate
+    # a chamada ADB do cartÃ£o vizinho.
+    active_processes_by_serial: dict[str, set[object]] = field(default_factory=dict, repr=False)
     process_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    active_serials: set[str] = field(default_factory=set)
+    device_stop_events: dict[str, threading.Event] = field(default_factory=dict, repr=False)
+    active_workers: int = 0
+    worker_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def stop_now(self) -> None:
         """Cancela ADBs em curso, além de sinalizar a lógica da execução."""
         self.stop_event.set()
+        with self.worker_lock:
+            for event in self.device_stop_events.values():
+                event.set()
         with self.process_lock:
             processes = tuple(self.active_processes)
         for process in processes:
@@ -168,6 +283,9 @@ class PanelStopProxy:
         self._fallback = fallback
 
     def _event(self) -> threading.Event:
+        device_event = getattr(self._context, "device_stop_event", None)
+        if device_event is not None:
+            return device_event
         run = getattr(self._context, "run", None)
         return run.stop_event if run is not None else self._fallback
 
@@ -203,6 +321,9 @@ class Action:
     xml_unavailable_tap_y: int | None = None
     match_mode: str = "exact"
     timeout_s: int = 10
+    # Espera aleatória após encontrar o XML e antes de tocar.
+    xml_tap_wait_min_ms: int = 0
+    xml_tap_wait_max_ms: int = 0
     label: str | None = None
     apk_file: str | None = None
     package_name: str | None = None
@@ -250,6 +371,9 @@ class Action:
     # Pasta relativa dentro do personagem vinculada à identidade atual.
     # A cada execução é sorteada uma única mídia dessa pasta.
     character_media_folder: str | None = None
+    # Categoria de mídia da pasta de identidade temporariamente sorteada.
+    # Não se mistura às pastas/links das Contas Normais.
+    identity_media_type: str | None = None
     normal_media_type: str | None = None  # photo | video (Conta Normal)
     normal_media_mode: str = "sequential"  # sequential | random
     flow_group: int | None = None  # grupo de origem usado apenas durante execução
@@ -273,6 +397,11 @@ class Action:
     proxy_urls: list[str] | None = None
     proxy_key: str | None = None
     proxy_type: str = "http-tunnel"
+    # Sequência configurável da etapa Enviar convite no navegador isolado.
+    # Cada item possui type (click/current_username/text/key/wait) e seus
+    # parâmetros, usando os nomes capturados na tela de seletores.
+    browser_actions: list[dict] | None = None
+    browser_url: str | None = None
     tap_chance_pct: float = 100.0
     # Chance do contêiner (subgrupo) ser executado. Para ações comuns permanece 100%.
     execution_chance_pct: float = 100.0
@@ -284,6 +413,10 @@ class Action:
     # começar na etapa selecionada para depuração. Ao encontrar a condição de
     # reinício, porém, esta lista contém o grupo completo a ser reiniciado.
     loop_restart_actions: list[dict] | None = None
+    # Grupo Loop XML que é dono desta validação. É preenchido apenas na
+    # representação de execução; impede que um reinício interno seja tratado
+    # como reinício de uma rota ou de um grupo-pai qualquer.
+    loop_restart_group: int | None = None
     # Lista exata de etapas do contêiner pai de "Código não chegou".
     # É metadado de execução, montado ao achatar subgrupos.
     restart_parent_actions: list[dict] | None = None
@@ -322,12 +455,17 @@ class Action:
     nav_after_actions: list[dict] | None = None
     # Subgrupo final de um Nav-S: só executa quando o tempo do Nav-S encerra.
     nav_s_alternative_group: bool = False
+    # Lista de condições XML. Ela pode ser usada como uma etapa normal ou como
+    # contingência dentro de um Nav-S quando as validações normais falham.
+    xml_list_queries: list[str] | None = None
+    xml_list_mode: str = "all"  # all | minimum
+    xml_list_min_matches: int = 1
     # Um subgrupo Ã© um contÃªiner de etapas inserido dentro de outro grupo.
     # As etapas ficam no prÃ³prio JSON, portanto acompanham a versÃ£o da macro.
     nested_actions: list[dict] | None = None
     nav_s_query: str = ""
     nav_s_third_query: str = ""
-    nav_s_verify_timeout_s: float = 3.0
+    nav_s_verify_timeout_s: float = 10.0
     nav_first_tap_chance_pct: float = 100.0
     nav_second_tap_chance_pct: float = 100.0
     nav_swipe_chance_pct: float = 0.0
@@ -349,33 +487,79 @@ class Adb:
         self.serial: str | None = None
         bundled = ADB_DIR / "adb.exe"
         self.path = str(bundled) if bundled.exists() else (shutil.which("adb") or "adb")
+        self._u2_device = None
+        self._u2_serial: str | None = None
+        self.last_xml_capture_source = ""
+        self.xml_capture_callback = None
 
-    def command(self, *args: str, timeout: float = 15) -> str:
+    def command(self, *args: str, timeout: float = 15, priority: int | None = None) -> str:
         base = [self.path]
         if self.serial:
             base += ["-s", self.serial]
         panel_run = getattr(ADB_PROCESS_CONTEXT, "run", None)
-        if panel_run and panel_run.stop_event.is_set():
-            raise InterruptedError("Execução interrompida")
-        process = subprocess.Popen(base + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                   encoding="utf-8", errors="replace", creationflags=NO_CONSOLE)
-        if panel_run:
-            with panel_run.process_lock:
-                panel_run.active_processes.add(process)
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            raise
-        finally:
-            if panel_run:
-                with panel_run.process_lock:
-                    panel_run.active_processes.discard(process)
-        if process.returncode:
+        device_stop_event = getattr(ADB_PROCESS_CONTEXT, "device_stop_event", None)
+        device_serial = str(getattr(ADB_PROCESS_CONTEXT, "serial", self.serial or ""))
+        reconnect = getattr(ADB_PROCESS_CONTEXT, "on_device_disconnected", None)
+        if priority is None:
+            # Input must be dispatched before a pending XML/screenshot from the
+            # same phone.  Other phones use independent gates and continue in
+            # parallel.
+            priority = 0 if len(args) >= 3 and args[0] == "shell" and args[1] == "input" else (
+                1 if any("uiautomator" in str(value) for value in args) else 2
+            )
+        gate = _adb_serial_gate(device_serial)
+
+        def disconnected(detail: str) -> bool:
+            text = str(detail).casefold()
+            markers = (
+                "device not found", "device offline", "device unauthorized",
+                "no devices/emulators found", "closed", "connection reset",
+                "transport error", "more than one device",
+            )
+            return bool(device_serial and any(marker in text for marker in markers))
+
+        while True:
+            if ((device_stop_event is not None and device_stop_event.is_set())
+                    or (panel_run and panel_run.stop_event.is_set())):
+                raise InterruptedError("Execução interrompida")
+            if gate is not None:
+                gate.acquire(priority, device_stop_event or (panel_run.stop_event if panel_run else None))
+            process = None
+            try:
+                process = subprocess.Popen(base + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                           encoding="utf-8", errors="replace", creationflags=NO_CONSOLE)
+                if gate is not None:
+                    gate.set_active_process(process, priority)
+                if panel_run and process is not None:
+                    with panel_run.process_lock:
+                        panel_run.active_processes.add(process)
+                        panel_run.active_processes_by_serial.setdefault(device_serial, set()).add(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    raise
+            finally:
+                if panel_run:
+                    with panel_run.process_lock:
+                        panel_run.active_processes.discard(process)
+                        processes = panel_run.active_processes_by_serial.get(device_serial)
+                        if processes is not None:
+                            processes.discard(process)
+                            if not processes:
+                                panel_run.active_processes_by_serial.pop(device_serial, None)
+                if gate is not None:
+                    gate.release()
+            if not process.returncode:
+                return stdout
             detail = stderr.strip() or stdout.strip() or "sem detalhe retornado pelo aparelho"
+            # Durante uma execuÃ§Ã£o, desconectar Ã© pausa e nÃ£o erro. O callback
+            # espera somente este serial voltar a ficar autorizado e, entÃ£o,
+            # repete a mesma chamada ADB sem encerrar o restante do fluxo.
+            if disconnected(detail) and callable(reconnect) and reconnect(device_serial, device_stop_event):
+                continue
             raise RuntimeError(f"ADB falhou em {' '.join(args[:3])}: {detail}")
-        return stdout
 
     def devices(self) -> list[tuple[str, str]]:
         # `adb devices` precisa funcionar mesmo se o último aparelho escolhido
@@ -388,6 +572,28 @@ class Adb:
         out = run.stdout
         return [tuple(line.split(maxsplit=1)) for line in out.splitlines()[1:]
                 if "\t" in line]
+
+    def connection_snapshot(self) -> tuple[tuple[str, str, str], ...]:
+        """Retorna estado e sessão ADB de cada aparelho conectado.
+
+        ``transport_id`` muda quando o mesmo serial reconecta. Isso detecta
+        uma retirada rápida do cabo que pode passar inteira entre duas leituras
+        e, por isso, parecer ``device -> device`` para a lista convencional.
+        """
+        run = subprocess.run([self.path, "devices", "-l"], capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=12,
+                             creationflags=NO_CONSOLE)
+        if run.returncode:
+            raise RuntimeError(run.stderr.strip() or run.stdout.strip() or "ADB falhou")
+        result: list[tuple[str, str, str]] = []
+        for line in run.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            token = next((value.split(":", 1)[1] for value in parts[2:]
+                          if value.startswith("transport_id:")), "")
+            result.append((str(parts[0]), str(parts[1]), token))
+        return tuple(sorted(result))
 
     def launch_package(self, package: str, timeout: float = 20) -> None:
         """Abre um app pelo launcher, inclusive em Androids com launcher customizado."""
@@ -541,71 +747,88 @@ class Adb:
         time.sleep(0.25)
 
     def ui_xml(self, timeout: float = 12, force_root_recovery: bool = False) -> str:
-        """Serializa dumps do mesmo telefone antes de acessar uiautomator."""
-        key = str(self.serial or "__default__")
+        """Compatibilidade: toda leitura XML usa o servidor uiautomator2."""
+        return self.uiautomator2_xml(timeout=timeout)
+
+    def _ensure_uiautomator2_server_locked(self, serial: str):
+        if self._u2_device is None or self._u2_serial != serial:
+            self._u2_device = u2.connect(serial)
+            self._u2_serial = serial
+        return self._u2_device
+
+    def ensure_uiautomator2_server(self, timeout: float = 12) -> None:
+        """Inicia e confirma o servidor OpenATX, sem capturar a hierarquia."""
+        if u2 is None:
+            raise RuntimeError("uiautomator2 não está instalado neste computador")
+        serial = str(self.serial or "").strip()
+        if not serial:
+            raise RuntimeError("Selecione um telefone antes de iniciar o uiautomator2")
         with _UI_XML_LOCKS_GUARD:
-            lock = _UI_XML_LOCKS.setdefault(key, threading.Lock())
-        wait_s = max(20.0, float(timeout) * 4)
-        if not lock.acquire(timeout=wait_s):
+            lock = _UI_XML_LOCKS.setdefault(serial, threading.Lock())
+        if not lock.acquire(timeout=max(20.0, float(timeout) * 2)):
             raise RuntimeError("Outra captura XML deste telefone ainda está em andamento")
         try:
-            return self._ui_xml_locked(timeout=timeout, force_root_recovery=force_root_recovery)
+            self._ensure_uiautomator2_server_locked(serial)
+        except Exception as error:
+            self._u2_device = None
+            self._u2_serial = None
+            raise RuntimeError(f"Não foi possível iniciar o uiautomator2: {error}") from error
+        finally:
+            lock.release()
+
+    def uiautomator2_xml(self, timeout: float = 12) -> str:
+        """Lê a hierarquia pelo OpenATX sem esperar a tela ficar ociosa."""
+        if u2 is None:
+            raise RuntimeError("uiautomator2 não está instalado neste computador")
+        serial = str(self.serial or "").strip()
+        if not serial:
+            raise RuntimeError("Selecione um telefone antes de capturar o XML")
+        with _UI_XML_LOCKS_GUARD:
+            lock = _UI_XML_LOCKS.setdefault(serial, threading.Lock())
+        if not lock.acquire(timeout=max(20.0, float(timeout) * 2)):
+            raise RuntimeError("Outra captura XML deste telefone ainda está em andamento")
+        try:
+            device = self._ensure_uiautomator2_server_locked(serial)
+            xml = str(device.dump_hierarchy(compressed=True) or "")
+            start = xml.find("<?xml")
+            if start < 0:
+                start = xml.find("<hierarchy")
+            xml = xml[start:] if start >= 0 else ""
+            if "<hierarchy" not in xml:
+                raise RuntimeError("uiautomator2 não retornou um XML válido")
+            if len(xml.encode("utf-8")) > MAX_UI_XML_BYTES:
+                raise RuntimeError(f"XML muito grande para abrir com segurança (limite de {MAX_UI_XML_BYTES // 1_000_000} MB)")
+            self.last_xml_capture_source = "uiautomator2"
+            return xml
+        except Exception as error:
+            self._u2_device = None
+            self._u2_serial = None
+            if isinstance(error, RuntimeError):
+                raise
+            raise RuntimeError(f"Falha no fallback uiautomator2: {error}") from error
         finally:
             lock.release()
 
     def _ui_xml_locked(self, timeout: float = 12, force_root_recovery: bool = False) -> str:
-        """Captura o XML com recuperação de falhas transitórias do uiautomator."""
-        last_error: Exception | None = None
-        attempts = 2
-        # Em telas grandes, especialmente depois de reconectar o aparelho, o
-        # primeiro dump pode levar mais de 3.5 s. Cortá-lo cedo e matá-lo
-        # criava um ciclo infinito de processos presos. A recuperação abaixo
-        # ainda protege a execução, mas primeiro deixa uma captura legítima
-        # concluir.
-        per_attempt = max(6.0, min(float(timeout), 9.0))
-
-        def valid_xml(output: str) -> str:
-            """Remove mensagens auxiliares que alguns Androids põem no dump."""
-            start = output.find("<?xml")
-            if start < 0:
-                start = output.find("<hierarchy")
-            candidate = output[start:] if start >= 0 else ""
-            return candidate if "<hierarchy" in candidate else ""
-
-        for attempt in range(attempts):
-            # Alternar o arquivo e apagá-lo antes do dump impede reutilizar um
-            # XML antigo depois de um encerramento inesperado do Android.
-            path = f"/sdcard/iggent_ui_{attempt % 2}.xml"
-            compressed = " --compressed" if attempt else ""
-            command = f"rm -f {path}; uiautomator dump{compressed} {path} >/dev/null && cat {path}"
-            try:
-                xml = self.command("shell", command, timeout=per_attempt)
-                xml = valid_xml(xml)
-                if xml:
-                    return xml
-                last_error = RuntimeError("uiautomator não retornou um XML válido")
-            except (OSError, subprocess.SubprocessError, RuntimeError) as error:
-                last_error = error
-            if attempt < attempts - 1:
-                time.sleep(0.45)
-        # Só depois de duas tentativas genuínas fazemos a limpeza. Isso evita
-        # matar o próprio uiautomator enquanto ele ainda inicializa.
-        self._recover_uiautomator(use_root=force_root_recovery)
-        # Em alguns fabricantes o dump trava ao escrever no armazenamento do
-        # aparelho. Esta rota lê diretamente pela saída do ADB, sem criar nem
-        # copiar XML no telefone, portanto independe do caminho que travou.
-        try:
-            direct = self.command(
-                "exec-out", "uiautomator", "dump", "--compressed", "/dev/tty",
-                timeout=max(9.0, per_attempt + 2.0),
-            )
-            xml = valid_xml(direct)
-            if xml:
-                return xml
-            last_error = RuntimeError("dump direto não retornou um XML válido")
-        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
-            last_error = error
-        raise RuntimeError(f"Não foi possível capturar o XML após {attempts} tentativas: {last_error}")
+        """Faz uma única tentativa curta pela rota padrão do Android."""
+        path = "/sdcard/iggent_ui.xml"
+        command = (
+            f"rm -f {path}; uiautomator dump --compressed {path} >/dev/null && "
+            f"size=$(wc -c < {path} 2>/dev/null || echo 0); "
+            f"if [ \"$size\" -gt {MAX_UI_XML_BYTES} ]; then "
+            f"echo __IGGENT_XML_TOO_LARGE__:$size; else cat {path}; fi"
+        )
+        xml = self.command("shell", command, timeout=max(1.0, min(float(timeout), 4.0)))
+        if "__IGGENT_XML_TOO_LARGE__:" in xml:
+            size = xml.rsplit("__IGGENT_XML_TOO_LARGE__:", 1)[-1].strip().splitlines()[0]
+            raise RuntimeError(f"XML muito grande para abrir com segurança ({size} bytes)")
+        start = xml.find("<?xml")
+        if start < 0:
+            start = xml.find("<hierarchy")
+        xml = xml[start:] if start >= 0 else ""
+        if "<hierarchy" not in xml:
+            raise RuntimeError("uiautomator não retornou um XML válido")
+        return xml
 
     def try_ui_xml(self, timeout: float = 4) -> str:
         """Obtém o XML sem confundir uma falha transitória com XML ausente.
@@ -626,7 +849,7 @@ class Adb:
                 # Na execução normal, cada lote de captura usa a limpeza root
                 # desde a primeira falha. O modo padrão continua mais leve
                 # para consultas isoladas e testes locais.
-                xml = self.ui_xml(timeout=timeout, force_root_recovery=True)
+                xml = self.capture_ui_xml(timeout=timeout, retries=2, stop_event=stop_event)
                 if xml and "<" in xml:
                     if recovery_round and callable(recovery_callback):
                         recovery_callback("restored", recovery_round)
@@ -647,6 +870,21 @@ class Adb:
             else:
                 time.sleep(pause_s)
         return ""
+
+    def capture_ui_xml(self, timeout: float = 12, retries: int = 3,
+                       stop_event: threading.Event | None = None) -> str:
+        """Captura XML exclusivamente pelo servidor uiautomator2."""
+        self.last_xml_capture_source = ""
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Captura XML interrompida")
+        try:
+            result = self.uiautomator2_xml(timeout=timeout)
+            callback = self.xml_capture_callback
+            if callable(callback):
+                callback(self.last_xml_capture_source)
+            return result
+        except (OSError, subprocess.SubprocessError, RuntimeError) as u2_error:
+            raise RuntimeError(f"Não foi possível capturar o XML pelo uiautomator2 ({u2_error})") from u2_error
 
     def keep_awake(self, enabled: bool) -> None:
         """Mantem a tela ligada somente enquanto uma operacao estiver ativa."""
@@ -675,7 +913,15 @@ class Adb:
         if self.serial:
             command += ["-s", self.serial]
         command += ["exec-out", "screencap", "-p"]
-        run = subprocess.run(command, capture_output=True, timeout=12, creationflags=NO_CONSOLE)
+        stop_event = getattr(ADB_PROCESS_CONTEXT, "device_stop_event", None)
+        gate = _adb_serial_gate(str(self.serial or ""))
+        if gate is not None:
+            gate.acquire(2, stop_event)
+        try:
+            run = subprocess.run(command, capture_output=True, timeout=12, creationflags=NO_CONSOLE)
+        finally:
+            if gate is not None:
+                gate.release()
         if run.returncode or not run.stdout:
             raise RuntimeError(run.stderr.decode("utf-8", "replace").strip() or "Não consegui capturar a tela.")
         return run.stdout
@@ -903,7 +1149,10 @@ class MacroApp(tk.Tk):
         # Uma execu\u00e7\u00e3o paralela publica uma etapa por telefone. Uma \u00fanica
         # tupla aqui fazia o \u00faltimo evento sobrescrever os demais antes do
         # Tk desenhar a tela; por isso apenas um celular ficava marcado.
-        self._pending_running_items: dict[str, str | None] = {}
+        # Além do item, retemos o painel de origem. O mesmo serial pode ter
+        # uma macro diferente em outro painel; sem esse vínculo a árvore
+        # visível aceitava um caminho válido, porém de outro fluxo.
+        self._pending_running_items: dict[str, tuple[str | None, str | None]] = {}
         self._execution_ui_commit_scheduled = False
         self._suppress_status_log = False
         self.run_active = False
@@ -940,6 +1189,34 @@ class MacroApp(tk.Tk):
         # reconnect/DPI o SDL pode manter uma borda invisível de alguns pixels.
         self.scrcpy_client_bounds: tuple[int, int, int, int] | None = None
         self.scrcpy_serial = ""
+        # Pré-carga invisível: cada telefone conectado pode manter o seu
+        # scrcpy pronto para a prévia do Fluxo, sem uma nova espera ao trocar
+        # de celular.
+        self.warm_scrcpy_processes: dict[str, subprocess.Popen] = {}
+        self.warm_scrcpy_windows: dict[str, int] = {}
+        # Cada telefone usa seu próprio túnel local do scrcpy.  Depender da
+        # escolha automática de porta durante seis partidas simultâneas pode
+        # fazer dois clientes reaproveitarem o mesmo canal ADB/servidor.
+        self.warm_scrcpy_ports: dict[str, int] = {}
+        self.warm_scrcpy_queue: list[str] = []
+        self.warm_scrcpy_starting = False
+        self.warm_scrcpy_starting_serials: set[str] = set()
+        self.warm_scrcpy_retry_attempts: dict[str, int] = {}
+        self.warm_scrcpy_retry_pending: set[str] = set()
+        # Servidores XML são iniciados em fila quando o aparelho conecta. Isso
+        # deixa a primeira etapa XML imediata sem sobrecarregar o ADB ao ligar
+        # vários telefones de uma vez.
+        self.uiautomator2_ready_serials: set[str] = set()
+        self.uiautomator2_start_queue: list[str] = []
+        self.uiautomator2_starting_serial = ""
+        # A lista e a prévia só são liberadas após existir uma janela própria
+        # para cada telefone conectado. Isso evita iniciar pelo telefone já
+        # selecionado enquanto as demais reservas ainda disputam o ADB.
+        self.device_visual_pool_expected: set[str] = set()
+        self.device_visual_pool_wait_scheduled = False
+        self.device_visual_pool_loading = False
+        self.device_visual_pool_started_at = 0.0
+        self.live_view_uses_warm_pool = False
         self.live_view_session = 0
         self.live_view_edit_mode = False
         self._live_edit_mouse_down = False
@@ -960,13 +1237,25 @@ class MacroApp(tk.Tk):
         self._live_layout_pending = False
         self.grid_scrcpy_processes: dict[str, subprocess.Popen] = {}
         self.grid_scrcpy_windows: dict[str, int] = {}
+        self.grid_scrcpy_recovery_attempts: dict[str, int] = {}
         self.device_grid_hosts: dict[str, tk.Frame] = {}
         self.device_grid_screen_labels: dict[str, tk.Label] = {}
         self.device_grid_log_widgets: dict[str, tk.Text] = {}
         self.device_grid_card_widgets: dict[str, tk.Frame] = {}
         self.device_grid_title_details: dict[str, tk.Label] = {}
         self.device_grid_flow_trees: dict[str, ttk.Treeview] = {}
+        # Painéis de etapas são montados em pequenos lotes para que abrir todos
+        # os fluxos não monopolize o ciclo de pintura do Tk.
+        self.grid_detail_build_generation = 0
         self.grid_focused_panel = ""
+        # Ctrl/Alt na grade pertencem estritamente ao Ãºltimo cartÃ£o cuja
+        # lista de etapas foi manipulada. Nunca ao cartÃ£o que por acaso estÃ¡
+        # sob o cursor neste instante.
+        self.grid_edit_serial = ""
+        # A grade e o editor usam árvores diferentes. Guardamos a última
+        # seleção feita em uma lista compacta para que voltar ao Fluxo abra o
+        # mesmo telefone e mantenha a mesma etapa em foco.
+        self.grid_last_stage_context: dict[str, object] = {}
         # Na grade de celulares cada telefone pode abrir seu próprio resumo de
         # fluxo. O estado é separado da tela principal para a grade continuar
         # naturalmente minimizada ao entrar nela.
@@ -976,9 +1265,18 @@ class MacroApp(tk.Tk):
         # ou automaticamente no cartão cujo fluxo compacto foi aberto.
         self.device_grid_logs_visible = False
         self.device_grid_layout_mode = "panel"
+        # A estrutura da aba Celulares Ã© montada em segundo plano assim que
+        # a lista ADB chega. Assim trocar de aba nÃ£o precisa criar os cartÃµes
+        # antes de conseguir mostrar as telas que jÃ¡ estÃ£o aquecidas.
+        self.device_grid_preload_pending = False
         self.grid_live_position_pollers: set[tuple[str, int, int]] = set()
         self.grid_marker_windows: dict[str, tuple[tk.Toplevel, tk.Canvas]] = {}
         self.grid_marker_selected_items: dict[str, str] = {}
+        # Cada seleção recebe uma revisão. O Tk agenda uma segunda pintura
+        # curta para ficar acima do scrcpy; sem a revisão, ao editar cartões em
+        # sequência essa pintura atrasada podia restaurar a máscara anterior.
+        self.grid_marker_revisions: dict[str, int] = {}
+        self.grid_macro_screens: dict[tuple[str, str, str], tuple[int, int]] = {}
         # Área XML encontrada durante a execução, independente para cada
         # telefone da grade.
         self.grid_xml_marker_bounds: dict[str, tuple[tuple[int, int, int, int], tuple[int, int]]] = {}
@@ -1005,12 +1303,16 @@ class MacroApp(tk.Tk):
         self.device_calibrations: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
         self.awake_serials: set[str] = set()
         self.screen_timeout_by_serial: dict[str, str] = {}
+        self.screen_awake_watchdog_lock = threading.Lock()
         self.legacy_awake_cleanup_pending = True
         self.settings = self._load_settings()
         self._ensure_number_api_settings()
         self.panels = self._load_panels()
         self.macros: dict[str, list[dict]] = {panel["id"]: [] for panel in self.panels}
         self.macro_devices: dict[str, dict] = {panel["id"]: {} for panel in self.panels}
+        # A árvore principal mantém somente uma macro por vez. Esta chave
+        # evita reler e reconstruir a mesma macro a cada clique no telefone.
+        self._loaded_macro_key: tuple[str, str] | None = None
         self.saved_names = self._load_names()
         self._load_panel_files()
         self._vars()
@@ -1038,29 +1340,74 @@ class MacroApp(tk.Tk):
         self.after(100, self._process_events)
         self.after(60, self._poll_global_escape)
         self.after(80, self._poll_live_coordinate_editing)
+        self.after(12000, self._screen_awake_watchdog)
+        # Observa reconexões USB/ADB enquanto a tela Celulares está aberta.
+        # Não exige clicar em Atualizar para recolocar o cartão e sua tela.
+        self.device_connection_watch_signature: tuple[tuple[str, str, str], ...] | None = None
+        self.device_connection_watch_running = False
+        self.device_connection_refresh_pending = False
+        self.after(2500, self._watch_device_connections)
         self.refresh_devices()
         self.refresh_recording_list()
 
     def on_close(self) -> None:
-        """Restaura o comportamento de tela dos aparelhos usados pelo app."""
+        """Fecha a interface imediatamente, sem aguardar auxiliares."""
+        if getattr(self, "_closing_now", False):
+            return
+        self._closing_now = True
         for active_run in tuple(self.panel_runs.values()):
             active_run.stop_now()
-        self.stop_live_view()
-        self._stop_grid_live_views()
-        # ``terminate`` é assíncrono e alguns scrcpy demoravam a fechar no
-        # instante em que o Tk era destruído. Antes de sair, elimine e aguarde
-        # toda a árvore de visualizações iniciada por esta instância.
-        self._close_orphaned_scrcpy_views(wait=True)
-        for serial in tuple(self.awake_serials):
+        processes = [self.scrcpy_process, *self.grid_scrcpy_processes.values(), *self.warm_scrcpy_processes.values()]
+        pids = {int(process.pid) for process in processes if process is not None and process.poll() is None}
+        # Um processo substituÃ­do durante uma troca antiga pode nÃ£o estar mais
+        # nos mapas acima. Ainda assim ele Ã© filho direto desta instÃ¢ncia, logo
+        # Ã© seguro encontrÃ¡-lo e encerrÃ¡-lo sem tocar em scrcpy externo.
+        script = (
+            f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={os.getpid()}' | "
+            "Where-Object { $_.Name -eq 'scrcpy.exe' } | Select-Object -ExpandProperty ProcessId"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=0.8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            pids.update(int(value.strip()) for value in result.stdout.splitlines() if value.strip().isdigit())
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for process in {item for item in processes if item is not None}:
             try:
-                adb = Adb()
-                adb.path, adb.serial = self.adb.path, serial
-                adb.keep_awake(False)
-                previous_timeout = self.screen_timeout_by_serial.get(serial)
-                if previous_timeout:
-                    adb.command("shell", "settings", "put", "system", "screen_off_timeout", previous_timeout, timeout=5)
-            except Exception:
+                if process.poll() is None:
+                    process.terminate()
+            except OSError:
                 pass
+        # terminate() sozinho pode deixar o servidor SDL do scrcpy aberto por
+        # alguns segundos. taskkill /T encerra a Ã¡rvore de cada janela antes
+        # de a interface desaparecer, sem bloquear o fechamento do Iggents.
+        for pid in pids:
+            try:
+                subprocess.Popen(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except OSError:
+                pass
+        # O ADB mantém um servidor em segundo plano mesmo depois que o último
+        # comando cliente termina. Como ele foi usado pelo Iggents nesta
+        # sessão, encerre-o explicitamente para não deixar adb.exe aberto após
+        # fechar o programa. Não usamos taskkill: o próprio ADB encerra apenas
+        # o seu servidor e preserva qualquer outro processo do usuário.
+        try:
+            subprocess.run(
+                [self.adb.path, "kill-server"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.5,
+                creationflags=NO_CONSOLE,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
         self.destroy()
 
     def _start_maximized(self) -> None:
@@ -1220,13 +1567,21 @@ class MacroApp(tk.Tk):
                 timeout = adb.command("shell", "settings", "get", "system", "screen_off_timeout", timeout=5).strip()
                 if timeout.isdecimal():
                     self.screen_timeout_by_serial[serial] = timeout
-                adb.command("shell", "settings", "put", "system", "screen_off_timeout", "2147483647", timeout=5)
             except (OSError, subprocess.SubprocessError, RuntimeError):
                 pass
-        # `svc power stayon usb` é o mecanismo que o Android aplica enquanto o
-        # aparelho está conectado por USB; o timeout máximo cobre fabricantes
-        # que ignoram apenas esse serviço.
-        adb.command("shell", "svc", "power", "stayon", "usb", timeout=8)
+        # Alguns Redmi/MIUI repõem este valor após alguns minutos. Escrevê-lo
+        # em cada reforço é seguro: o original continua guardado acima para
+        # ser restaurado quando o switch for desligado.
+        adb.command("shell", "settings", "put", "system", "screen_off_timeout", "2147483647", timeout=5)
+        # ``true`` não depende do estado de carregamento USB. Era usado
+        # somente ``usb``, que o MIUI pode ignorar quando considera a porta
+        # apenas como dados, embora o ADB esteja conectado.
+        try:
+            adb.command("shell", "svc", "power", "stayon", "true", timeout=8)
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            # Androids mais antigos não aceitam ``true``; nesses a forma USB
+            # ainda é melhor do que deixar o switch sem efeito.
+            adb.command("shell", "svc", "power", "stayon", "usb", timeout=8)
         self.awake_serials.add(serial)
 
     def _release_screen_awake(self, adb: Adb, serial: str) -> None:
@@ -1246,6 +1601,47 @@ class MacroApp(tk.Tk):
         timeout = adb.command("shell", "settings", "get", "system", "screen_off_timeout", timeout=5).strip()
         if timeout == "2147483647":
             adb.command("shell", "settings", "put", "system", "screen_off_timeout", "30000", timeout=5)
+
+    def _screen_awake_watchdog(self) -> None:
+        """Reforça a tela ligada de todos os celulares conectados.
+
+        O Android puro honra ``stayon`` continuamente, mas alguns MIUI voltam
+        ao bloqueio automático depois de uma economia de bateria. A cada 20 s
+        reaplicamos a preferência só nos aparelhos marcados e acordamos um
+        que tenha sido apagado por essa política.
+        """
+        if getattr(self, "_closing_now", False):
+            return
+
+        def job() -> None:
+            if not self.screen_awake_watchdog_lock.acquire(blocking=False):
+                return
+            try:
+                serials = {
+                    str(profile.get("serial", ""))
+                    for profile in self.device_profiles.values()
+                    if profile.get("state") == "device" and str(profile.get("serial", ""))
+                }
+                for serial in serials:
+                    try:
+                        adb = Adb()
+                        adb.path, adb.serial = self.adb.path, serial
+                        self._keep_screen_awake(adb, serial)
+                        power_state = adb.command("shell", "dumpsys", "power", timeout=6)
+                        asleep = ("mWakefulness=Asleep" in power_state
+                                  or "mWakefulness=Dozing" in power_state
+                                  or "Display Power: state=OFF" in power_state)
+                        if asleep:
+                            adb.command("shell", "input", "keyevent", "KEYCODE_WAKEUP", timeout=6)
+                    except (OSError, subprocess.SubprocessError, RuntimeError):
+                        # Desconectados e aparelhos ainda autorizando ADB são
+                        # tentados de novo no próximo ciclo, sem aviso falso.
+                        continue
+            finally:
+                self.screen_awake_watchdog_lock.release()
+
+        self._thread(job)
+        self.after(20000, self._screen_awake_watchdog)
 
     def enable_dark_titlebar(self) -> None:
         """Usa a barra nativa escura e o tom de destaque do iggents no Windows."""
@@ -1462,6 +1858,11 @@ class MacroApp(tk.Tk):
         style.configure("Treeview", background="#161619", fieldbackground="#161619", foreground="#d4d0d8", rowheight=29,
                         borderwidth=0, relief="flat", bordercolor="#161619")
         style.configure("Treeview.Heading", background="#212126", foreground="#d5bbfa", relief="flat", font=("Segoe UI Semibold", 9), padding=8)
+        # A árvore da grade é uma visualização de acompanhamento, não o
+        # editor completo. Linhas e cabeçalho menores deixam mais etapas
+        # visíveis sem alterar o conforto da árvore principal.
+        style.configure("GridCompact.Treeview", rowheight=22, font=("Segoe UI", 9))
+        style.configure("GridCompact.Treeview.Heading", font=("Segoe UI Semibold", 8), padding=4)
         style.map("Treeview", background=[("selected", "#7037b5")], foreground=[("selected", "#ffffff")])
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         style.configure("Horizontal.TProgressbar", background="#df4b82", troughcolor="#29292e", bordercolor="#29292e", lightcolor="#df4b82", darkcolor="#df4b82")
@@ -1794,7 +2195,7 @@ class MacroApp(tk.Tk):
         device_header.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         tk.Label(device_header, text=f"{'MODELO / GRUPO':<22} {'APELIDO':<20} {'CÓDIGO':<20} {'NOME / @':<26} {'PROXY':<22} {'EXECUÇÃO':<18}",
                  bg="#151d2b", fg="#a9b5c8", font=("Consolas", 9), anchor="w").pack(side="left", padx=(42, 0))
-        ctk.CTkButton(device_header, text="⟳ Atualizar", command=self.refresh_devices, width=104, height=26, corner_radius=7,
+        ctk.CTkButton(device_header, text="⟳ Atualizar", command=self.refresh_connected_devices_and_views, width=104, height=26, corner_radius=7,
                       fg_color="#292d35", hover_color="#393e48").pack(side="right", padx=(0, 5), pady=1)
         self.device_area = tk.Frame(bar, bg="#111925", height=205,
                                     highlightthickness=1, highlightbackground="#33435d")
@@ -1819,7 +2220,7 @@ class MacroApp(tk.Tk):
         self.device_status_states: list[str] = []
         self.device_list.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
         self.device_list.bind("<<ListboxSelect>>", self.populate_profile)
-        self.device_switch_rail = tk.Frame(self.device_list_content, bg="#111925", width=236)
+        self.device_switch_rail = tk.Frame(self.device_list_content, bg="#111925", width=120)
         self.device_switch_rail.pack(side="left", fill="y", padx=(4, 8), pady=1)
         self.device_switch_rail.pack_propagate(False)
         self.device_row_switches: list[ctk.CTkSwitch] = []
@@ -1873,20 +2274,22 @@ class MacroApp(tk.Tk):
         self.record_button = ctk.CTkButton(action_row, text="● Gravar", command=self.start_recording,
                                            width=92, height=30, corner_radius=9, fg_color="#2f6fed", hover_color="#4b82ee")
         self.record_button.grid(row=0, column=0, padx=(0, 8))
-        ctk.CTkButton(action_row, text="■ Parar", command=self.stop_all, width=92, height=30, corner_radius=9,
+        ctk.CTkButton(action_row, text="■ Parar", command=self.stop_current_device, width=92, height=30, corner_radius=9,
                       fg_color="#b9404d", hover_color="#d6515e").grid(row=0, column=1, padx=(0, 8))
+        ctk.CTkButton(action_row, text="■■ Parar todos", command=self.stop_all_panels, width=112, height=30, corner_radius=9,
+                      fg_color="#7f2937", hover_color="#a23b4b").grid(row=0, column=2, padx=(0, 8))
         ctk.CTkButton(action_row, text="▶ Executar", command=self.run_macro, width=98, height=30, corner_radius=9,
-                      fg_color="#2f6fed", hover_color="#4b82ee").grid(row=0, column=2, padx=(0, 8))
+                      fg_color="#2f6fed", hover_color="#4b82ee").grid(row=0, column=3, padx=(0, 8))
         ctk.CTkButton(action_row, text="Executar daqui", command=self.run_from_selection, width=122, height=30, corner_radius=9,
-                      fg_color="#39455b", hover_color="#4a5870").grid(row=0, column=3, padx=(0, 14))
-        ctk.CTkButton(action_row, text="Reproduzir etapa", command=self.run_selected_action, width=126, height=30, corner_radius=9,
                       fg_color="#39455b", hover_color="#4a5870").grid(row=0, column=4, padx=(0, 14))
+        ctk.CTkButton(action_row, text="Reproduzir etapa", command=self.run_selected_action, width=126, height=30, corner_radius=9,
+                      fg_color="#39455b", hover_color="#4a5870").grid(row=0, column=5, padx=(0, 14))
         ctk.CTkCheckBox(action_row, text="Mostrar pontos/traços", variable=self.show_touches_var, width=170, height=30,
                       checkbox_width=18, checkbox_height=18, corner_radius=5, fg_color="#2f6fed",
-                         hover_color="#4b82ee", text_color="#dbe5f2", command=self.apply_touch_overlay).grid(row=0, column=5, padx=(0, 20), sticky="w")
-        ttk.Label(action_row, text="Início aleatório até (s):").grid(row=0, column=6, padx=(0, 5), sticky="e")
+                         hover_color="#4b82ee", text_color="#dbe5f2", command=self.apply_touch_overlay).grid(row=0, column=6, padx=(0, 20), sticky="w")
+        ttk.Label(action_row, text="Início aleatório até (s):").grid(row=0, column=7, padx=(0, 5), sticky="e")
         ctk.CTkEntry(action_row, textvariable=self.start_delay_max, width=62, height=30, corner_radius=8,
-                     fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=7, sticky="w")
+                     fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=8, sticky="w")
 
         version_row = tk.Frame(controls, bg="#11141a")
         version_row.grid(row=1, column=0, pady=(7, 0), sticky="ew")
@@ -2001,6 +2404,8 @@ class MacroApp(tk.Tk):
         self.tree.bind("<Control-y>", self.redo)
         self.tree.bind("<Control-Up>", lambda _event: self.move_selected(-1))
         self.tree.bind("<Control-Down>", lambda _event: self.move_selected(1))
+        self.tree.bind("<Home>", lambda _event: self.focus_tree_boundary("start"))
+        self.tree.bind("<End>", lambda _event: self.focus_tree_boundary("end"))
         self.tree.bind("<Shift-Home>", lambda event: self.select_tree_boundary("start"))
         self.tree.bind("<Shift-End>", lambda event: self.select_tree_boundary("end"))
         self.tree.bind("<Control-Shift-Home>", lambda event: self.select_tree_boundary("start"))
@@ -2015,6 +2420,8 @@ class MacroApp(tk.Tk):
         self.bind_all("<Key-g>", self.shortcut_new_group)
         self.bind_all("<Control-f>", self.focus_action_search)
         self.bind_all("<Control-Shift-F>", self.focus_tree_search)
+        self.bind_all("<Control-Key-1>", lambda _event: self.shortcut_show_app_view("fluxo"))
+        self.bind_all("<Control-Key-2>", lambda _event: self.shortcut_show_app_view("celulares"))
         self.bind_all("<space>", self.shortcut_execute)
         self.bind_all("<Alt-Down>", self.shortcut_execute_from_selection)
         self.bind_all("<F6>", self.shortcut_run_selected_action)
@@ -2106,7 +2513,9 @@ class MacroApp(tk.Tk):
         add_action_button("Novo grupo", self.new_group, "grupo", pady=(0, 6))
         add_action_button("+ Subgrupo", self.add_subgroup, "grupo dentro grupo etapas bloco")
         add_action_button("+ Etapa XML", self.add_xml_action, "elemento tocar")
+        add_action_button("Espera global dos XMLs", self.configure_global_xml_tap_wait, "xml espera toque global minimo maximo aleatorio")
         add_action_button("+ Grupo XML condicional", self.add_xml_logic_action, "xml procurar condicao grupo se encontrar")
+        add_action_button("+ Lista de XMLs", self.add_xml_list_action, "xml lista todos minimo validacao grupo nav-s fallback")
         add_action_button("+ XML: continuar grupo", self.add_xml_group_gate_action, "xml condicional se achar continuar grupo se nao proximo")
         add_action_button("+ XML: clicar qualquer", self.add_xml_any_tap_group, "grupo procurar qualquer xml tocar primeiro encontrado")
         add_action_button("+ Nav-R", self.add_navigate_r_group, "grupo arrasto toque duplo repetir")
@@ -2135,15 +2544,17 @@ class MacroApp(tk.Tk):
         add_action_button("Ver Aguardando", self.show_waiting_identities, "fila aguardando nomes")
         add_action_button("+ Usuário aleatório treino", self.add_training_username_action, "usuario aleatorio treino")
         add_action_button("Gerenciar usuários de treino", self.manage_training_users, "usuario aleatorio treino lista atual excluir")
-        add_action_button("Gerenciar nomes", self.manage_random_users, "nome link arquivos excluir")
-        add_action_button("Gerenciar personagens", self.manage_random_characters, "personagem pasta midias links")
+        add_action_button("Gerenciar identidades", self.manage_identities, "nomes sobrenomes links aleatorios")
+        add_action_button("Pasta de identidades", self.manage_identity_media_root, "identidade perfil story verificacao midias")
         add_action_button("Usuários já usados", self.manage_used_identities, "identidades email arroba liberar reutilizar remover")
         add_action_button("Editar nome e sobrenome", self.edit_device_identity, "nome sobrenome celular atual")
-        add_action_button("+ Enviar mídias", self.add_random_user_files_action, "midias imagens galeria enviar")
+        add_action_button("+ Mídia da identidade", self.add_random_user_files_action, "perfil story verificacao identidade midias galeria enviar")
         add_action_button("+ Enviar foto normal", lambda: self.add_normal_media_action("photo"), "conta normal foto pasta sequencial aleatorio")
         add_action_button("+ Enviar vídeo normal", lambda: self.add_normal_media_action("video"), "conta normal video pasta sequencial aleatorio")
         add_action_button("+ Limpar Imagens", self.add_clear_downloads_action, "imagens galeria limpar apagar")
-        add_action_button("+ Digitar link do nome", self.add_random_user_link_action, "link url")
+        add_action_button("+ Digitar link aleatório", self.add_random_user_link_action, "link identidade aleatorio url")
+        add_action_button("+ Enviar convite", self.add_browser_invite_action, "facebook meta desenvolvedor convite testador instagram")
+        add_action_button("Capturar seletores do convite", self.manage_invite_selectors, "facebook meta navegador seletor capturar organizar clique")
         add_action_button("+ Título do link", self.add_link_title_action, "titulo link sortear")
         add_action_button("+ Digitar texto", self.add_type_text_action, "texto personalizado escrever")
         add_action_button("+ Automação no PC", self.add_pc_automation_action, "pc computador mouse clicks clicar digitar arroba usuario")
@@ -2199,8 +2610,12 @@ class MacroApp(tk.Tk):
                  font=("Segoe UI Semibold", 16)).pack(side="left")
         tk.Label(heading, text="Ctrl: gravar toque/arrasto • Alt: reposicionar etapa", bg="#0d0d0f", fg="#94a3b8",
                  font=("Segoe UI", 10)).pack(side="left", padx=(12, 0), pady=(5, 0))
-        ctk.CTkButton(heading, text="Atualizar", command=lambda: self.refresh_devices(fast=True), width=94, height=30,
+        ctk.CTkButton(heading, text="Atualizar", command=self.refresh_connected_devices_and_views, width=94, height=30,
                       corner_radius=8, fg_color="#2b3850", hover_color="#3a4c69").pack(side="right")
+        # A grade é uma área de execução completa: este botão interrompe todas
+        # as execuções em curso, mesmo que pertençam a cartões/painéis distintos.
+        ctk.CTkButton(heading, text="■■ Parar todos", command=self.stop_all_panels, width=118, height=30,
+                      corner_radius=8, fg_color="#7f2937", hover_color="#a23b4b").pack(side="right", padx=(0, 8))
         self.device_grid_log_toggle = ctk.CTkButton(
             heading,
             text="Ocultar logs" if self.device_grid_logs_visible else "Exibir logs",
@@ -2212,6 +2627,10 @@ class MacroApp(tk.Tk):
             hover_color="#4a3479",
         )
         self.device_grid_log_toggle.pack(side="right", padx=(0, 8))
+        ctk.CTkButton(
+            heading, text="Limpar todos logs", command=self.clear_all_device_grid_logs,
+            width=132, height=30, corner_radius=8, fg_color="#39455b", hover_color="#4a5870",
+        ).pack(side="right", padx=(0, 8))
         self.device_grid_layout_toggle = ctk.CTkButton(
             heading, text="Juntar painéis", command=self.toggle_device_grid_layout,
             width=122, height=30, corner_radius=8, fg_color="#39455b", hover_color="#4a5870",
@@ -2331,7 +2750,11 @@ class MacroApp(tk.Tk):
         elif action == "stop":
             # O cartão já informa o painel certo; não troque a tela principal
             # apenas para entregar um sinal de parada.
-            self.stop_all(panel)
+            self.stop_device_execution(serial, panel)
+        elif action == "stop_all":
+            # Para todos os cartões deste painel, sem encerrar uma gravação
+            # que possa estar sendo feita em outro telefone/painel.
+            self.stop_all(panel, stop_recording=False)
         else:
             # O cartão pertence a um telefone específico. Portanto sua
             # execução nunca dispara os outros telefones do mesmo painel, nem
@@ -2351,6 +2774,61 @@ class MacroApp(tk.Tk):
             return
         self.status.set(f"Iniciando todos os celulares de {self.panel_name(panel)}; início aleatório de até {maximum:g} s.")
         self.run_macro(refresh_first=False, run_all_panels=False, target_panel=panel)
+
+    def stop_device_execution(self, serial: str, panel: str) -> None:
+        """Para somente o celular acionado no cartão de Celulares."""
+        active_run = self.panel_runs.get(str(panel))
+        if active_run is None:
+            self.status.set("Este celular não está em execução.")
+            return
+        with active_run.worker_lock:
+            stop_event = active_run.device_stop_events.get(str(serial))
+        if stop_event is None:
+            self.status.set("Este celular não está em execução neste painel.")
+            return
+        stop_event.set()
+        # A etapa pode estar em um ADB demorado (uiautomator, instalação,
+        # swipe etc.). Encerramos somente os subprocessos pertencentes a este
+        # serial; os processos dos demais celulares do mesmo painel ficam
+        # intactos e seus workers seguem sem esperar por este encerramento.
+        with active_run.process_lock:
+            processes = tuple(active_run.active_processes_by_serial.get(str(serial), set()))
+        for process in processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except (AttributeError, OSError):
+                pass
+        self._append_execution_log("Execução deste celular interrompida.", str(panel), str(serial))
+        self.status.set("Encerrando somente a execução deste celular…")
+
+    def _current_execution_target(self) -> tuple[str, str] | None:
+        """Retorna somente o celular que a pessoa estÃ¡ manipulando agora."""
+        in_grid = bool(getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares")
+        if in_grid:
+            serial = str(getattr(self, "grid_edit_serial", "") or "")
+            panel = str(getattr(self, "grid_focused_panel", "") or "")
+            if serial and panel:
+                return panel, serial
+        selected = self.selected_profiles()
+        if len(selected) == 1 and selected[0].get("state") == "device":
+            return self.flow_var.get(), str(selected[0].get("serial", ""))
+        return None
+
+    def stop_current_device(self) -> None:
+        """Parada normal: nunca atravessa para outro celular/painel."""
+        target = self._current_execution_target()
+        if target:
+            panel, serial = target
+            active_run = self.panel_runs.get(panel)
+            if active_run and serial in active_run.active_serials:
+                self.stop_device_execution(serial, panel)
+                return
+        # GravaÃ§Ã£o Ã© uma Ãºnica sessÃ£o local, portanto o botÃ£o comum ainda
+        # pode encerrÃ¡-la. NÃ£o usa stop_all nem afeta execuÃ§Ãµes paralelas.
+        if self.stop_recording():
+            return
+        self.status.set("O celular que estÃ¡ sendo manipulado nÃ£o estÃ¡ em execução.")
 
     def _grid_run_from_item(self, serial: str, panel: str, tree: ttk.Treeview) -> None:
         # A grade compacta usa exatamente o mesmo caminho da lista principal.
@@ -2391,6 +2869,7 @@ class MacroApp(tk.Tk):
 
     def _grid_activate_tree_item(self, serial: str, panel: str, tree: ttk.Treeview) -> bool:
         """Leva a seleção do cartão compacto para a árvore principal."""
+        self._focus_grid_task_tree(serial, panel)
         selected = tree.selection()
         if not selected:
             return False
@@ -2414,6 +2893,11 @@ class MacroApp(tk.Tk):
         self.tree.see(source_focus if source_focus in source_items else source_items[0])
         return True
 
+    def _focus_grid_task_tree(self, serial: str, panel: str) -> None:
+        """Define o único cartão autorizado a receber Ctrl/Alt na grade."""
+        self.grid_edit_serial = str(serial)
+        self.grid_focused_panel = str(panel)
+
     def _grid_tree_shortcut(self, serial: str, panel: str, tree: ttk.Treeview, command: str):
         if command == "run_one":
             self._grid_run_selected_item(serial, panel, tree)
@@ -2429,6 +2913,29 @@ class MacroApp(tk.Tk):
             self._grid_prepare_panel_context(serial, panel)
             self.select_all_tree()
             self._reload_compact_flow_tree(tree, serial, panel, getattr(tree, "grid_fallback_model", ""))
+            return "break"
+        if command in {"focus_start", "focus_end"}:
+            # O Treeview compacto Ã© apenas outra visÃ£o da Ã¡rvore principal.
+            # Primeiro selecionamos o extremo no cartÃ£o e, em seguida,
+            # sincronizamos a seleÃ§Ã£o principal para que Home/End tenham o
+            # mesmo resultado nas duas telas.
+            items: list[str] = []
+
+            def collect(parent: str = "") -> None:
+                for item in tree.get_children(parent):
+                    items.append(item)
+                    collect(item)
+
+            collect()
+            if not items:
+                return "break"
+            target = items[0] if command == "focus_start" else items[-1]
+            tree.selection_set(target)
+            tree.focus(target)
+            tree.see(target)
+            if self._grid_activate_tree_item(serial, panel, tree):
+                self.focus_tree_boundary("start" if command == "focus_start" else "end")
+                self._reload_compact_flow_tree(tree, serial, panel, getattr(tree, "grid_fallback_model", ""))
             return "break"
         if command in {"boundary_start", "boundary_end"} and not tree.selection() and tree.focus():
             tree.selection_set(tree.focus())
@@ -2469,13 +2976,36 @@ class MacroApp(tk.Tk):
         # chamava ``populate_profile`` para cada clique e recarregava o painel
         # inteiro, causando atraso visível. A sincronização com a árvore
         # principal fica para editar, executar ou gravar via Ctrl.
+        self._focus_grid_task_tree(serial, panel)
         self._hide_live_touch_marker()
         selected = tree.selection()
         compact_item = tree.focus() if tree.focus() in selected else (selected[0] if selected else "")
         source_item = getattr(tree, "grid_source_items", {}).get(compact_item)
+        source_items = [
+            source for item in selected
+            if (source := getattr(tree, "grid_source_items", {}).get(item))
+        ]
+        if source_items:
+            # Não sincronizamos a árvore principal a cada clique — isso
+            # recarregaria o editor escondido — mas a seleção continua sendo
+            # recuperável quando a pessoa retornar para ele.
+            self.grid_last_stage_context = {
+                "serial": str(serial), "panel": str(panel),
+                "items": tuple(source_items), "focus": str(source_item or source_items[0]),
+            }
         if source_item:
             self.grid_marker_selected_items[serial] = source_item
+        revision = self.grid_marker_revisions.get(serial, 0) + 1
+        self.grid_marker_revisions[serial] = revision
         self._update_grid_touch_marker(serial, source_item)
+        # A janela SDL pode terminar um reposicionamento logo depois do clique
+        # e cobrir uma máscara desenhada no mesmo ciclo do Tk. Reafirmamos a
+        # seleção depois de a janela nativa estabilizar, sem reconstruir a
+        # grade nem mudar o item marcado.
+        def reaffirm_marker(target=serial, item=source_item, expected=revision) -> None:
+            if self.grid_marker_revisions.get(target) == expected:
+                self._update_grid_touch_marker(target, item)
+        self.after(45, reaffirm_marker)
 
     def _grid_edit_compact_tree_cell(self, serial: str, panel: str, tree: ttk.Treeview, event) -> None:
         """Edita início, duração e espera do cartão com um único clique."""
@@ -2632,7 +3162,7 @@ class MacroApp(tk.Tk):
             return f"{'s' * (len(path) - 1)}:{group_index}:" + ":".join(str(value) for value in path)
 
         labels = {
-            "tap": "Toque", "swipe": "Arrasto", "xml_tap": "XML", "xml_logic": "XML condicional",
+            "tap": "Toque", "swipe": "Arrasto", "xml_tap": "XML", "xml_logic": "XML condicional", "xml_list": "Lista de XMLs",
             "subgroup": "Subgrupo", "navigate_r": "Nav-R", "navigate_s": "Nav-S", "navigate_rc": "Nav-R-C",
             "number_code_not_received": "Código não chegou",
         }
@@ -2656,6 +3186,8 @@ class MacroApp(tk.Tk):
                 return action.nav_s_query or "XML"
             if action.kind == "xml_any_tap":
                 return f"{len(action.branch_actions or [])} XML"
+            if action.kind == "xml_list":
+                return f"{len(action.xml_list_queries or [])} XML"
             if action.kind in ("tap", "swipe", "nav_rc_scroll"):
                 return f"{action.x}, {action.y}"
             if action.kind == "key":
@@ -2709,21 +3241,39 @@ class MacroApp(tk.Tk):
 
         # A pesquisa da grade não muda a macro: apenas oculta as linhas que
         # não combinam, preservando os pais dos resultados encontrados.
-        query = str(getattr(tree, "grid_search_var", tk.StringVar(value="")).get()).strip().casefold()
-        if query:
-            def keep_matching_items(item: str) -> bool:
-                children_match = any(keep_matching_items(child) for child in tree.get_children(item))
-                text = str(tree.item(item, "text"))
-                values = " ".join(str(value) for value in tree.item(item, "values"))
-                matches = query in f"{text} {values}".casefold()
-                keep = matches or children_match
-                if children_match:
-                    tree.item(item, open=True)
-                if not keep:
-                    tree.detach(item)
-                return keep
-            for root_item in tree.get_children(""):
-                keep_matching_items(root_item)
+        query = str(getattr(tree, "grid_search_var", tk.StringVar(value="")).get()).strip()
+        queries = [part.strip() for part in query.split(",") if part.strip()]
+        search_matches: list[tuple[float, str]] = []
+
+        def walk(item_parent: str = ""):
+            for item in tree.get_children(item_parent):
+                yield item
+                yield from walk(item)
+
+        for item in walk():
+            tags = tuple(tag for tag in tree.item(item, "tags") if tag != "search_match")
+            tree.item(item, tags=tags)
+            if not queries:
+                continue
+            values = " ".join(str(value) for value in tree.item(item, "values"))
+            searchable = f"{tree.item(item, 'text')} {values}"
+            scores = [self._action_search_score(term, searchable) for term in queries]
+            valid_scores = [float(score) for score in scores if score is not None]
+            if valid_scores:
+                search_matches.append((max(valid_scores), item))
+
+        search_matches.sort(key=lambda entry: -entry[0])
+        query_changed = query != getattr(tree, "grid_search_last_query", "")
+        tree.grid_search_last_query = query
+        tree.grid_search_matches = [item for _score, item in search_matches]
+        for _score, item in search_matches:
+            tags = tuple(tree.item(item, "tags"))
+            if "running" not in tags:
+                tree.item(item, tags=(*tags, "search_match"))
+            parent = tree.parent(item)
+            while parent:
+                tree.item(parent, open=True)
+                parent = tree.parent(parent)
 
         # Não deixe Delete/Ctrl+X/Ctrl+V/mover/undo recolher a árvore inteira
         # só porque o cartão precisou redesenhar suas linhas. O estado já
@@ -2733,68 +3283,112 @@ class MacroApp(tk.Tk):
             for source, compact in reverse_items.items():
                 if self.tree.exists(source):
                     tree.item(compact, open=bool(self.tree.item(source, "open")))
+            if queries:
+                for item in tree.grid_search_matches:
+                    parent = tree.parent(item)
+                    while parent:
+                        tree.item(parent, open=True)
+                        parent = tree.parent(parent)
             selected = [reverse_items[source] for source in self.tree.selection() if source in reverse_items]
             if selected:
                 tree.selection_set(selected)
                 focused = self.tree.focus()
                 tree.focus(reverse_items.get(focused, selected[0]))
-            tree.yview_moveto(previous_scroll)
+            show_first_match = bool(search_matches and query_changed)
+            if show_first_match:
+                tree.see(search_matches[0][1])
+            else:
+                tree.yview_moveto(previous_scroll)
+            # ttk calcula a altura real somente depois de voltar ao loop do
+            # Tk. Reaplicar a mesma fraÃ§Ã£o depois da montagem impede que um
+            # Delete em uma lista compacta pule para o inÃ­cio.
+            if not show_first_match:
+                tree.after_idle(lambda widget=tree, position=previous_scroll:
+                                widget.yview_moveto(position) if widget.winfo_exists() else None)
+                tree.after(55, lambda widget=tree, position=previous_scroll:
+                           widget.yview_moveto(position) if widget.winfo_exists() else None)
         except tk.TclError:
             pass
 
     def _build_device_grid_flow_panel(self, parent: tk.Widget, serial: str, panel: str, fallback_model: str) -> None:
         """Cria o painel compacto de controles e etapas da grade de celulares."""
-        detail = tk.Frame(parent, bg="#171b26", width=390, height=810,
+        # Este resumo precisa acompanhar o celular, não disputar largura com
+        # ele. Duas colunas são suficientes durante a execução: a etapa e a
+        # ação atual. Os demais detalhes continuam disponíveis no editor.
+        detail_width = 205
+        detail = tk.Frame(parent, bg="#171b26", width=detail_width, height=810,
                           highlightthickness=1, highlightbackground="#6940a8")
         detail.pack_propagate(False)
         tk.Label(detail, text=f"{self.panel_name(panel)} · fluxo", bg="#171b26", fg="#e9d5ff",
                  font=("Segoe UI Semibold", 11)).pack(anchor="w", padx=8, pady=(7, 4))
         toolbar = tk.Frame(detail, bg="#171b26")
-        toolbar.pack(fill="x", padx=8, pady=(0, 7))
+        toolbar.pack(fill="x", padx=6, pady=(0, 7))
+        toolbar_top = tk.Frame(toolbar, bg="#171b26")
+        toolbar_top.pack(fill="x", pady=(0, 4))
+        toolbar_bottom = tk.Frame(toolbar, bg="#171b26")
+        toolbar_bottom.pack(fill="x")
+        # Grade fixa, igual ao layout de referência: duas ações grandes na
+        # primeira linha e três ações iguais na segunda. ``pack`` tentava
+        # acomodar seis botões e acabava reduzindo/ocultando comandos.
+        for column in range(2):
+            toolbar_top.grid_columnconfigure(column, weight=1, uniform="compact-top")
+        for column in range(3):
+            toolbar_bottom.grid_columnconfigure(column, weight=1, uniform="compact-bottom")
         controls = (
             ("● Gravar", "record", "#6d35bb"),
             ("■ Parar", "stop", "#a8394c"),
-            ("▶ Executar", "run", "#6d35bb"),
             ("▶▶ Executar daqui", "run_from", "#39455b"),
             ("▶ Etapa", "run_one", "#39455b"),
+            ("▶ Executar", "run", "#39455b"),
         )
-        for text, action, color in controls:
-            ctk.CTkButton(toolbar, text=text,
+        compact_labels = {
+            "record": "Gravar", "stop": "Parar", "run": "Executar",
+            "run_from": "Daqui", "run_one": "Etapa",
+        }
+        for index, (text, action, color) in enumerate(controls):
+            row = toolbar_top if index < 2 else toolbar_bottom
+            ctk.CTkButton(row, text=compact_labels[action],
                           command=(lambda: self._grid_run_from_item(serial, panel, compact))
                           if action == "run_from"
                           else (lambda: self._grid_run_selected_item(serial, panel, compact))
                           if action == "run_one"
                           else (lambda value=action: self._grid_run_panel_action(serial, panel, value)),
-                          width=108 if action == "run_from" else 82, height=28, corner_radius=7, fg_color=color,
-                           hover_color="#8552c7" if action != "stop" else "#c34a5d").pack(side="left", padx=(0, 5))
+                          height=28, corner_radius=7, fg_color=color,
+                           hover_color="#8552c7" if action != "stop" else "#c34a5d").grid(
+                               row=0, column=index if index < 2 else index - 2,
+                               sticky="ew", padx=(0, 4) if index not in (1, 4) else 0,
+                           )
         search_var = tk.StringVar()
         search_box = ctk.CTkEntry(
             detail, textvariable=search_var, height=28,
             placeholder_text="Pesquisar etapa neste fluxo…",
         )
-        search_box.pack(fill="x", padx=8, pady=(0, 7))
+        search_box.pack(fill="x", padx=6, pady=(0, 7))
         groups = self._grid_groups_for_device(serial, panel, fallback_model)
         tree_frame = tk.Frame(detail, bg="#0c0e14", highlightthickness=1, highlightbackground="#30394a")
         # Reserva o rodapé dos controles: a árvore cresce apenas até antes
         # dele e nunca pode empurrar “Executar daqui” para fora do cartão.
-        tree_frame.pack(fill="both", expand=True, padx=8, pady=(0, 43))
-        compact = ttk.Treeview(tree_frame, columns=("kind", "start", "duration", "wait"), show="tree headings", height=24,
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=(0, 43))
+        compact = ttk.Treeview(tree_frame, style="GridCompact.Treeview",
+                               columns=("kind", "start", "duration", "wait"), show="tree headings", height=24,
                                selectmode="extended")
         compact.heading("#0", text="Grupo / etapa")
         compact.heading("kind", text="Ação")
         compact.heading("start", text="Início")
         compact.heading("duration", text="Duração")
         compact.heading("wait", text="Espera")
-        compact.column("#0", width=104, stretch=True)
-        compact.column("kind", width=55, anchor="w", stretch=False)
-        compact.column("start", width=76, anchor="w", stretch=False)
-        compact.column("duration", width=58, anchor="e", stretch=False)
-        compact.column("wait", width=52, anchor="e", stretch=False)
+        compact["displaycolumns"] = ("kind",)
+        compact.column("#0", width=120, minwidth=108, stretch=True)
+        compact.column("kind", width=54, minwidth=50, anchor="w", stretch=False)
+        compact.column("start", width=80, anchor="w", stretch=False)
+        compact.column("duration", width=55, anchor="e", stretch=False)
+        compact.column("wait", width=1, stretch=False)
         compact.pack(side="left", fill="both", expand=True, padx=1, pady=1)
         compact_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=compact.yview)
         compact_scroll.pack(side="right", fill="y", pady=1)
         compact.configure(yscrollcommand=compact_scroll.set)
         compact.tag_configure("running", background="#1e654a", foreground="#ffffff")
+        compact.tag_configure("search_match", background="#3a2851", foreground="#f0d9ff")
         compact.tag_configure("schedule_divider", background="#252138", foreground="#dac4ff")
         compact.grid_fallback_model = fallback_model
         compact.grid_panel = panel
@@ -2806,8 +3400,8 @@ class MacroApp(tk.Tk):
             serial, self.device_execution_states.get(serial, {}).get("running")
         )
         compact.bind("<<TreeviewSelect>>", lambda _event: self._grid_compact_tree_selected(serial, panel, compact))
-        compact.bind("<FocusIn>", lambda _event, value=panel: setattr(self, "grid_focused_panel", str(value)), add="+")
-        compact.bind("<ButtonPress-1>", lambda _event, value=panel: setattr(self, "grid_focused_panel", str(value)), add="+")
+        compact.bind("<FocusIn>", lambda _event, target=serial, value=panel: self._focus_grid_task_tree(target, value), add="+")
+        compact.bind("<ButtonPress-1>", lambda _event, target=serial, value=panel: self._focus_grid_task_tree(target, value), add="+")
         # No painel Celulares Ctrl+F mantém o mesmo propósito da tela
         # principal: abrir a busca de etapas para adicionar ao fluxo.
         compact.bind("<Control-f>", self.focus_action_search)
@@ -2828,15 +3422,20 @@ class MacroApp(tk.Tk):
                 add="+",
             )
         footer = tk.Frame(detail, bg="#171b26")
-        footer.place(x=8, y=772, width=374, height=31)
+        footer.place(x=6, y=772, width=detail_width - 12, height=31)
+        ctk.CTkButton(footer, text="Parar todos",
+                      command=lambda: self.stop_all(panel, stop_recording=False),
+                      width=88, height=28, corner_radius=7,
+                      fg_color="#7f2937", hover_color="#c34a5d").pack(side="left")
         ctk.CTkButton(footer, text="Fechar",
                       command=lambda: self.toggle_device_grid_flow_panel(serial, panel),
-                      width=78, height=28, corner_radius=7, fg_color="#2b2d35", hover_color="#3b3e49").pack(side="right")
+                      width=64, height=28, corner_radius=7, fg_color="#2b2d35", hover_color="#3b3e49").pack(side="right")
         shortcuts = {
             "<Alt-Down>": "run_from", "<space>": "run", "<Delete>": "delete", "<F2>": "rename",
             "<F3>": "toggle", "<F4>": "variation_toggle", "<F5>": "variation", "<F6>": "run_one", "<Control-Return>": "configure",
             "<Control-Up>": "up", "<Control-Down>": "down", "<Control-c>": "copy", "<Control-x>": "cut",
             "<Control-v>": "paste", "<Control-z>": "undo", "<Control-y>": "redo", "<Control-e>": "expand", "<Control-a>": "select_all",
+            "<Home>": "focus_start", "<End>": "focus_end",
             "<Shift-Home>": "boundary_start", "<Shift-End>": "boundary_end",
             "<Control-Shift-Home>": "boundary_start", "<Control-Shift-End>": "boundary_end",
         }
@@ -2872,12 +3471,47 @@ class MacroApp(tk.Tk):
         if widget and widget.winfo_exists():
             widget.configure(state="normal")
             widget.delete("1.0", "end")
-        widget.configure(state="disabled")
+            widget.configure(state="disabled")
+
+    def clear_all_device_grid_logs(self) -> None:
+        """Limpa de uma vez os históricos e mini logs de todos os cartões."""
+        serials = set(self.device_logs_by_serial) | set(self.device_grid_log_widgets)
+        for serial in serials:
+            self.device_logs_by_serial[str(serial)] = []
+        for widget in tuple(self.device_grid_log_widgets.values()):
+            try:
+                if widget.winfo_exists():
+                    widget.configure(state="normal")
+                    widget.delete("1.0", "end")
+                    widget.configure(state="disabled")
+            except tk.TclError:
+                continue
+        self.status.set("Logs de todos os celulares limpos.")
 
     def show_device_grid_xml(self, serial: str, panel: str) -> None:
         """Abre o XML do telefone correspondente ao log da grade."""
         self._grid_prepare_panel_context(serial, panel)
         self.show_current_xml_viewer()
+
+    def _preload_device_grid(self) -> None:
+        """Monta os cartÃµes ocultos sem iniciar uma segunda tela scrcpy.
+
+        A lista de aparelhos Ã© atualizada de forma assÃ­ncrona. Preparar a
+        grade neste ponto elimina a primeira espera ao entrar em Celulares;
+        quando a aba abre, resta apenas mover as janelas scrcpy reservadas
+        para os respectivos hosts jÃ¡ existentes.
+        """
+        self.device_grid_preload_pending = False
+        if getattr(self, "_closing_now", False) or not hasattr(self, "device_grid_cards"):
+            return
+        self._refresh_device_grid()
+
+    def _schedule_device_grid_preload(self) -> None:
+        """Agrupa atualizaÃ§Ãµes consecutivas da lista em uma Ãºnica montagem."""
+        if self.device_grid_preload_pending:
+            return
+        self.device_grid_preload_pending = True
+        self.after_idle(self._preload_device_grid)
 
     def _refresh_device_grid(self, preserve_live_views: bool = False) -> None:
         if not hasattr(self, "device_grid_cards"):
@@ -2888,12 +3522,14 @@ class MacroApp(tk.Tk):
         if not preserve_live_views:
             self.grid_view_session += 1
         session = self.grid_view_session
+        self.grid_detail_build_generation += 1
+        detail_generation = self.grid_detail_build_generation
         # Durante a reconstrução as caixas dos cartões ainda mudam de lugar.
         # Esconder primeiro evita que uma máscara fique visível sobre o
         # telefone que acabou ocupando a posição antiga.
         self._hide_grid_markers()
         if not preserve_live_views:
-            self._stop_grid_live_views()
+            self._stop_grid_live_views(terminate=False)
         cards = self.device_grid_cards
         for child in cards.winfo_children():
             child.destroy()
@@ -2917,18 +3553,28 @@ class MacroApp(tk.Tk):
         self.device_grid_card_widgets = {}
         self.device_grid_title_details = {}
         self.device_grid_flow_trees = {}
+        self.grid_macro_screens.clear()
         # A seleção pertence ao serial, não ao widget que acabou de ser
         # recriado. Preservá-la permite restaurar a máscara correta depois da
         # atualização/redisposição dos cartões.
         # CartÃµes seguem a largura de uma tela vertical. Assim a grade usa o
         # espaÃ§o para colocar mais celulares lado a lado, sem sobras enormes
         # dentro de cada cartÃ£o.
-        card_width = 390
-        available_width = max(cards.winfo_width(), self.winfo_width() - 80)
+        # A tela Android continua com 480 px de altura. Nos aparelhos
+        # verticais conectados, 220 px de host preservam exatamente a mesma
+        # escala da imagem (limitada pela altura), removendo só as faixas
+        # cinzas laterais que sobravam dentro do cartão.
+        card_width = 230
+        screen_host_width = 220
+        detail_width = 205
+        available_width = max(cards.winfo_width(), self.winfo_width() - 48)
         # Capacidade real horizontal. Não limite pelo número de celulares:
         # ao abrir etapas, o cartão auxiliar precisa de uma segunda coluna
         # mesmo que exista apenas um telefone nesse painel.
-        columns = max(1, available_width // (card_width + 16))
+        # A coluna de etapas foi compactada, sem mudar a área da tela ao vivo.
+        # A grade trabalha em pares de colunas para os celulares poderem
+        # permanecer com suas etapas abertas.
+        columns = max(2, (available_width // (card_width + detail_width)) * 2)
         # Uma faixa por painel evita que celulares de fluxos diferentes
         # apareÃ§am na mesma linha horizontal. Os conectados sem ativaÃ§Ã£o
         # tambÃ©m ficam claros em uma faixa prÃ³pria.
@@ -2982,6 +3628,7 @@ class MacroApp(tk.Tk):
                     entries.append((section_cards, slot, section_columns, profile, panel_id, False, False)); slot += 1
                     if serial in self.device_grid_expanded_serials and panel_id != "__unassigned__":
                         entries.append((section_cards, slot, section_columns, profile, panel_id, True, False)); slot += 1
+        detail_jobs: list[tuple[tk.Frame, tk.Frame, int, int, str, str, str]] = []
         for section_cards, index, section_columns, profile, panel_id, is_detail, panel_starts_here in entries:
             serial = str(profile.get("serial", ""))
             saved = self.saved_names.get(serial, {})
@@ -2997,8 +3644,15 @@ class MacroApp(tk.Tk):
             card_height = 810 if show_log else 590
             section_cards.grid_rowconfigure(row, weight=0, minsize=820 if (show_log or is_detail) else 600)
             if is_detail:
-                detail = self._build_device_grid_flow_panel(section_cards, serial, panel_id, group)
-                detail.grid(row=row, column=column, sticky="n", padx=0, pady=0)
+                # As colunas alternam celular e etapas compactas.
+                section_cards.grid_columnconfigure(column, weight=0, minsize=detail_width)
+                placeholder = tk.Frame(section_cards, bg="#171b26", width=detail_width, height=810,
+                                       highlightthickness=1, highlightbackground="#6940a8")
+                placeholder.grid(row=row, column=column, sticky="n", padx=0, pady=0)
+                placeholder.pack_propagate(False)
+                tk.Label(placeholder, text="Carregando etapas…", bg="#171b26", fg="#bda4e6",
+                         font=("Segoe UI", 10)).pack(anchor="center", expand=True)
+                detail_jobs.append((section_cards, placeholder, row, column, serial, panel_id, group))
                 continue
             card = tk.Frame(section_cards, bg="#171b26", width=card_width, height=card_height,
                             highlightthickness=1, highlightbackground="#374151", cursor="hand2")
@@ -3016,9 +3670,12 @@ class MacroApp(tk.Tk):
                                     font=("Segoe UI", 9), anchor="w")
             title_detail.pack(anchor="w", fill="x", pady=(1, 0))
             self.device_grid_title_details[serial] = title_detail
-            screen_host = tk.Frame(card, bg="#090b10", width=card_width - 20, height=480,
+            screen_host = tk.Frame(card, bg="#090b10", width=screen_host_width, height=480,
                                    highlightthickness=1, highlightbackground="#30394a")
-            screen_host.pack(fill="x", expand=False, pady=(8, 4))
+            # Não expanda no eixo X: a janela SDL respeita o host e, ao
+            # preenchê-lo até 290 px, criava as bordas laterais sem aumentar a
+            # tela Android propriamente dita.
+            screen_host.pack(anchor="n", expand=False, pady=(8, 4))
             screen_host.pack_propagate(False)
             screen_label = tk.Label(screen_host, text="Iniciando tela ao vivo…", bg="#090b10", fg="#94a3b8",
                                     font=("Segoe UI", 10), cursor="hand2")
@@ -3031,17 +3688,24 @@ class MacroApp(tk.Tk):
             self.device_grid_screen_labels[serial] = screen_label
             log_holder = tk.Frame(card, bg="#0c0e14", height=180)
             log_holder.pack_propagate(False)
+            # Os comandos ficam em uma faixa própria. Antes eram posicionados
+            # sobre o Text e encobriam a última linha do log.
+            log_actions = tk.Frame(log_holder, bg="#0c0e14", height=31)
+            log_actions.pack(side="bottom", fill="x", padx=6, pady=(2, 5))
+            log_actions.pack_propagate(False)
+            log_content = tk.Frame(log_holder, bg="#0c0e14")
+            log_content.pack(side="top", fill="both", expand=True)
             device_log = tk.Text(
-                log_holder, height=15, bg="#0c0e14", fg="#cbd5e1", insertbackground="#cbd5e1",
+                log_content, height=15, bg="#0c0e14", fg="#cbd5e1", insertbackground="#cbd5e1",
                 relief="flat", highlightthickness=1, highlightbackground="#30394a",
                 font=("Consolas", 8), wrap="word", state="disabled", cursor="arrow", padx=7, pady=6,
             )
-            log_scroll = ttk.Scrollbar(log_holder, orient="vertical", command=device_log.yview)
+            log_scroll = ttk.Scrollbar(log_content, orient="vertical", command=device_log.yview)
             device_log.configure(yscrollcommand=log_scroll.set)
             device_log.pack(side="left", fill="both", expand=True)
             log_scroll.pack(side="right", fill="y")
             clear_log_button = ctk.CTkButton(
-                log_holder,
+                log_actions,
                 text="Limpar",
                 command=lambda target=serial: self.clear_device_grid_log(target),
                 width=62,
@@ -3051,9 +3715,9 @@ class MacroApp(tk.Tk):
                 hover_color="#454957",
                 font=("Segoe UI", 10),
             )
-            clear_log_button.place(relx=1.0, rely=1.0, x=-7, y=-6, anchor="se")
+            clear_log_button.pack(side="right")
             view_xml_button = ctk.CTkButton(
-                log_holder,
+                log_actions,
                 text="Ver XML",
                 command=lambda target=serial, target_panel=panel_id: self.show_device_grid_xml(target, target_panel),
                 width=72,
@@ -3063,7 +3727,7 @@ class MacroApp(tk.Tk):
                 hover_color="#4a5870",
                 font=("Segoe UI", 10),
             )
-            view_xml_button.place(relx=1.0, rely=1.0, x=-75, y=-6, anchor="se")
+            view_xml_button.pack(side="right", padx=(0, 6))
             # O bind_all da página principal ainda existe para o restante da
             # interface. Estes binds consomem a roda antes dela chegar lá.
             for scroll_target in (log_holder, device_log, log_scroll, clear_log_button, view_xml_button):
@@ -3094,11 +3758,34 @@ class MacroApp(tk.Tk):
             for widget in card.winfo_children():
                 widget.bind("<Button-1>", lambda _event, target=serial: self._select_grid_device(target))
             card.bind("<Button-1>", lambda _event, target=serial: self._select_grid_device(target))
+
+        def build_next_detail(position: int = 0) -> None:
+            if position >= len(detail_jobs) or detail_generation != self.grid_detail_build_generation:
+                return
+            parent, placeholder, row, column, serial, panel_id, group = detail_jobs[position]
+            try:
+                if placeholder.winfo_exists():
+                    placeholder.destroy()
+                    detail = self._build_device_grid_flow_panel(parent, serial, panel_id, group)
+                    detail.grid(row=row, column=column, sticky="n", padx=0, pady=0)
+            except tk.TclError:
+                pass
+            # Uma árvore por ciclo mantém animações, logs e telas vivas
+            # responsivos mesmo quando todos os cartões são abertos de uma vez.
+            self.after(1, lambda next_position=position + 1: build_next_detail(next_position))
+
+        if detail_jobs:
+            self.after(1, build_next_detail)
         if preserve_live_views:
             def reposition_live_views() -> None:
                 for serial, process in tuple(self.grid_scrcpy_processes.items()):
                     if process.poll() is None:
                         self._place_grid_live_view(serial, process.pid, session)
+                # Uma reconciliação pode ter incluído um telefone novo. As
+                # telas que permaneceram conectadas já estão no mapa acima;
+                # esta chamada apenas encaixa a reserva do novo cartão, sem
+                # reiniciar as outras.
+                self._start_grid_live_views(profiles, session)
             self.after(60, reposition_live_views)
         else:
             self.after(60, lambda values=profiles, token=session: self._start_grid_live_views(values, token))
@@ -3115,6 +3802,8 @@ class MacroApp(tk.Tk):
         values = [identity] if identity else []
         if proxy:
             values.append(f"Proxy: {proxy}")
+        if self.device_execution_states.get(str(serial), {}).get("paused"):
+            values.append("⏸ reconectando")
         return "  •  ".join(values)
 
     def _refresh_device_grid_title(self, serial: str) -> None:
@@ -3168,6 +3857,39 @@ class MacroApp(tk.Tk):
         except Exception:
             return None
 
+    def _grid_macro_coordinate_screen(self, serial: str) -> tuple[int, int]:
+        """Retorna a resolução-base da macro pertencente a este cartão.
+
+        A grade pode mostrar cartões de modelos e painéis diferentes. Usar a
+        macro aberta no editor para todos eles desloca a máscara e também faz
+        um Alt+clique salvar a posição na escala errada.
+        """
+        panel = self._grid_panel_for_serial(serial)
+        profile = next((item for item in self.device_profiles.values()
+                        if str(item.get("serial", "")) == str(serial)), {})
+        model = self._profile_model(self.saved_names.get(str(serial), {}),
+                                    str(profile.get("model", "")), panel)
+        if panel and panel == self.flow_var.get() and self._model_file_key(model) == self._model_file_key(self.device_model):
+            return self._macro_coordinate_screen()
+        cache_key = (str(serial), panel, self._model_file_key(model))
+        cached = self.grid_macro_screens.get(cache_key)
+        if cached:
+            return cached
+        if panel:
+            path = MACROS_DIR / f"{self._model_file_key(model)}_{panel}.json"
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                screen = data.get("screen", ()) if isinstance(data, dict) else ()
+                width, height = int(screen[0]), int(screen[1])
+                if width > 0 and height > 0:
+                    self.grid_macro_screens[cache_key] = (width, height)
+                    return width, height
+            except (OSError, ValueError, IndexError, TypeError, json.JSONDecodeError):
+                pass
+        result = self._grid_screen_size(serial) or self._macro_coordinate_screen()
+        self.grid_macro_screens[cache_key] = result
+        return result
+
     def _grid_scrcpy_bounds(self, serial: str) -> tuple[int, int, int, int] | None:
         host = self.device_grid_hosts.get(serial)
         if not host or not host.winfo_exists():
@@ -3190,7 +3912,7 @@ class MacroApp(tk.Tk):
             return None
         device_x = round((x - image_left) * (screen[0] - 1) / max(1, shown_w - 1))
         device_y = round((y - image_top) * (screen[1] - 1) / max(1, shown_h - 1))
-        macro_w, macro_h = self._macro_coordinate_screen()
+        macro_w, macro_h = self._grid_macro_coordinate_screen(serial)
         return (round(device_x * (macro_w - 1) / max(1, screen[0] - 1)),
                 round(device_y * (macro_h - 1) / max(1, screen[1] - 1)))
 
@@ -3342,7 +4064,8 @@ class MacroApp(tk.Tk):
             return
         left, top, width, height = bounds
         try:
-            macro_screen = self._action_coordinate_screen(action, self._macro_coordinate_screen(), None) if action else self._macro_coordinate_screen()
+            card_macro_screen = self._grid_macro_coordinate_screen(serial)
+            macro_screen = self._action_coordinate_screen(action, card_macro_screen, None) if action else card_macro_screen
             scale = min(width / screen[0], height / screen[1])
             shown_w, shown_h = max(1, round(screen[0] * scale)), max(1, round(screen[1] * scale))
             offset_x, offset_y = (width - shown_w) // 2, (height - shown_h) // 2
@@ -3402,6 +4125,9 @@ class MacroApp(tk.Tk):
             ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
             if ctrl or alt:
+                if str(serial) != str(self.grid_edit_serial):
+                    self.status.set("Selecione primeiro uma etapa na lista deste celular antes de usar Ctrl ou Alt.")
+                    return "break"
                 self.grid_modified_pointer_serials.add(serial)
                 # Reposicionar não pode depender da sondagem global do mouse.
                 # Ela continua ativa para a gravação com Ctrl, mas o Alt só
@@ -3517,6 +4243,8 @@ class MacroApp(tk.Tk):
         pressionada enquanto o foco troca de janela não é uma autorização para
         salvar uma coordenada nova na macro.
         """
+        if str(serial) != str(self.grid_edit_serial):
+            return
         panel = self._grid_panel_for_serial(serial) or self.flow_var.get()
         if not panel:
             return
@@ -3535,7 +4263,7 @@ class MacroApp(tk.Tk):
         if action.kind not in ("tap", "swipe"):
             return
         x, y = new_point
-        screen_w, screen_h = self._macro_coordinate_screen()
+        screen_w, screen_h = self._grid_macro_coordinate_screen(serial)
         self.push_undo()
         if action.kind == "tap":
             action.x, action.y = x, y
@@ -3571,7 +4299,12 @@ class MacroApp(tk.Tk):
         try:
             user32 = ctypes.windll.user32
             point = wintypes.POINT(); user32.GetCursorPos(ctypes.byref(point))
-            serial = self._grid_serial_under_cursor(point)
+            hovered_serial = self._grid_serial_under_cursor(point)
+            target_serial = str(self.grid_edit_serial or "")
+            # A lista compacta define o alvo. Se o mouse saiu da tela desse
+            # alvo, nÃ£o convertemos a posiÃ§Ã£o para outro aparelho nem
+            # continuamos uma gravaÃ§Ã£o no cartÃ£o errado.
+            serial = target_serial if target_serial and hovered_serial == target_serial else None
             down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)
             ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
             alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
@@ -3588,15 +4321,23 @@ class MacroApp(tk.Tk):
                 self.grid_alt_armed_serial = ""
                 self.grid_alt_armed_at = 0.0
             for target in tuple(self.grid_scrcpy_windows):
-                self._set_grid_scrcpy_passthrough(target, bool(target == serial and (ctrl or alt)))
+                # Mesmo sobre um cartÃ£o que nÃ£o Ã© o alvo, Ctrl/Alt nunca
+                # podem vazar como toque normal para o telefone. Fazemos a
+                # janela nativa passar o clique ao host, que o descarta pela
+                # regra do ``grid_edit_serial``.
+                self._set_grid_scrcpy_passthrough(target, bool(target == hovered_serial and (ctrl or alt)))
                 self._set_grid_marker_mouse_intercept(
                     target,
-                    bool(target == serial and (ctrl or alt))
+                    bool(target == hovered_serial and (ctrl or alt))
                     or bool(self.grid_xml_picker and str(self.grid_xml_picker.get("serial", "")) == str(target)),
                 )
             if self.grid_ctrl_record_starts and not down:
                 target, start = next(iter(self.grid_ctrl_record_starts.items()))
                 self.grid_ctrl_record_starts.pop(target, None)
+                if hovered_serial != target or target != target_serial:
+                    self.status.set("Gravação cancelada: o gesto saiu da tela do celular selecionado.")
+                    self.grid_edit_mouse_down = False
+                    return
                 panel = self._grid_panel_for_serial(target) or self.flow_var.get()
                 if panel:
                     self._grid_prepare_panel_context(target, panel)
@@ -3659,24 +4400,58 @@ class MacroApp(tk.Tk):
         if (session != self.grid_view_session or not getattr(self, "app_view_var", None)
                 or self.app_view_var.get() != "celulares"):
             return
-        self.grid_capture_stop.set()
-        # Iniciar vários servidores scrcpy no mesmo instante faz alguns
-        # aparelhos demorarem a criar a janela e ela pode cair no cartão
-        # seguinte. A fila mantém um serial por vez durante a inicialização.
-        self._start_next_grid_live_view(profiles, session, 0)
+        # Uma nova grade inicia as prévias; não pode herdar o marcador de
+        # parada deixado pela troca anterior para o Fluxo.
+        self.grid_capture_stop.clear()
+        # Cada telefone é independente. A fila antiga só iniciava o próximo
+        # depois de a janela anterior estar pronta, fazendo seis aparelhos
+        # parecerem travados um esperando pelo outro. Damos uma pequena
+        # separação entre os launches, mas todos seguem seu próprio ciclo de
+        # criação/reposicionamento em paralelo.
+        for index in range(len(profiles)):
+            self.after(index * 70, lambda position=index: self._start_next_grid_live_view(
+                profiles, session, position, advance=False
+            ))
 
-    def _start_next_grid_live_view(self, profiles: list[dict], session: int, index: int) -> None:
+    def _start_next_grid_live_view(self, profiles: list[dict], session: int, index: int,
+                                   advance: bool = True) -> None:
         if (session != self.grid_view_session or not getattr(self, "app_view_var", None)
                 or self.app_view_var.get() != "celulares" or index >= len(profiles)):
-            return
-        executable = APP_DIR / "tools" / "scrcpy" / "scrcpy-win64-v4.1" / "scrcpy.exe"
-        if not executable.exists():
             return
         profile = profiles[index]
         serial = str(profile.get("serial", ""))
         if not serial or serial not in self.device_grid_hosts:
-            self.after(0, lambda: self._start_next_grid_live_view(profiles, session, index + 1))
+            if advance:
+                self.after(0, lambda: self._start_next_grid_live_view(profiles, session, index + 1))
             return
+        # A mesma janela já preparada para o Fluxo é encaixada no cartão.
+        warmed = self.warm_scrcpy_processes.get(serial)
+        if warmed and not self._scrcpy_process_matches_serial(warmed, serial):
+            self.warm_scrcpy_processes.pop(serial, None)
+            self.warm_scrcpy_windows.pop(serial, None)
+            warmed = None
+        if warmed and warmed.poll() is None:
+            self.grid_scrcpy_processes[serial] = warmed
+            self.after(0, lambda current=serial, pid=warmed.pid, token=session:
+                       self._place_grid_live_view(
+                           current, pid, token,
+                           on_ready=(lambda: self._start_next_grid_live_view(profiles, session, index + 1))
+                           if advance else None,
+                        ))
+            return
+        # The reservation manager is the sole process creator.  The grid only
+        # requests the serial and retries placement when its SDL becomes ready.
+        self._queue_warm_live_view(serial)
+        if advance:
+            self.after(0, lambda: self._start_next_grid_live_view(profiles, session, index + 1))
+        else:
+            self.after(200, lambda: self._start_next_grid_live_view(profiles, session, index, advance=False))
+        return
+        # Se a reserva ainda estava apenas na fila, a grade passa a ser a
+        # Ãºnica responsÃ¡vel por iniciÃ¡-la. Sem remover essa pendÃªncia, ao
+        # voltar para Fluxo a fila criava uma segunda janela para o serial.
+        self.warm_scrcpy_queue = [queued for queued in self.warm_scrcpy_queue if queued != serial]
+        self.warm_scrcpy_retry_pending.discard(serial)
         next_started = False
 
         def start_next_once() -> None:
@@ -3684,19 +4459,25 @@ class MacroApp(tk.Tk):
             if next_started:
                 return
             next_started = True
-            # A próxima abre logo que a janela anterior foi encaixada no seu
-            # cartão, não depois de um intervalo fixo curto demais.
-            self.after(80, lambda: self._start_next_grid_live_view(profiles, session, index + 1))
+            if advance:
+                self.after(80, lambda: self._start_next_grid_live_view(profiles, session, index + 1))
         try:
             process = subprocess.Popen(
                 [str(executable), "--serial", serial,
                  "--window-title", f"iggents grade {session} {serial}",
-                 "--window-borderless", "--no-audio"],
+                 "--window-borderless", "--window-x", "-32000", "--window-y", "-32000", "--no-audio",
+                 # O cartão tem cerca de 270 × 480 px. Transmitir 1080p/60
+                 # para seis cartões só ocupa USB/GPU e compete com ADB/XML;
+                 # 540p/20 fps preserva a leitura e deixa margem para as
+                 # execuções e uma gravação rodarem simultaneamente.
+                 "--max-size=540", "--max-fps=20", "--video-bit-rate=2M", "--render-driver=opengl"],
                 cwd=str(executable.parent), stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                startupinfo=self._hidden_scrcpy_startupinfo(),
             )
             self.grid_scrcpy_processes[serial] = process
+            self.warm_scrcpy_processes[serial] = process
             self.after(120, lambda current=serial, pid=process.pid, token=session:
                        self._place_grid_live_view(current, pid, token, on_ready=start_next_once))
         except OSError:
@@ -3711,10 +4492,27 @@ class MacroApp(tk.Tk):
             return
         process = self.grid_scrcpy_processes.get(serial)
         host = self.device_grid_hosts.get(serial)
-        if (not process or process.pid != process_id or process.poll() is not None
-                or not host or not host.winfo_exists()):
+        if not process or process.pid != process_id or not host or not host.winfo_exists():
             return
-        hwnd = self.grid_scrcpy_windows.get(serial, 0) or self._window_for_process(process.pid)
+        if process.poll() is not None:
+            self._recover_grid_live_view(serial, session)
+            return
+        # Calls can arrive after refresh/reconnection.  Before moving a SDL to
+        # a card, confirm that the process command still belongs to THIS
+        # serial.  PID alone cannot authorize showing the Note 12 in the A21s
+        # card when a stale map entry survived a reconciliation.
+        if not self._scrcpy_process_matches_serial(process, serial):
+            self.grid_scrcpy_processes.pop(serial, None)
+            self.grid_scrcpy_windows.pop(serial, None)
+            self._queue_warm_live_view(serial)
+            return
+        # As reservas nascem fora da tela e alguns SDL as reportam como
+        # ocultas. Procurar somente janelas visíveis fazia a grade aguardar
+        # indefinidamente mesmo com o scrcpy saudável já aberto.
+        # Reencontre sempre pelo PID atual. Reusar só o HWND em cache permite
+        # que uma alça reciclada pelo Windows faça um cartão mostrar a tela de
+        # outro celular após reconectar/atualizar a grade.
+        hwnd = self._window_for_process(process.pid, include_hidden=True)
         if not hwnd:
             # Alguns aparelhos (em especial os Samsung) levam vários segundos
             # para terminar de iniciar o servidor e criar a janela SDL. Antes
@@ -3723,6 +4521,8 @@ class MacroApp(tk.Tk):
             # associação serial -> janela até 15 s, sem criar outro processo.
             if attempt < 75:
                 self.after(200, lambda: self._place_grid_live_view(serial, process_id, session, attempt + 1, on_ready))
+            else:
+                self._recover_grid_live_view(serial, session)
             return
         picker_for_serial = bool(self.grid_xml_picker and str(self.grid_xml_picker.get("serial", "")) == str(serial))
         inspecting_serial = str(self.grid_xml_inspection_serial) == str(serial)
@@ -3757,7 +4557,12 @@ class MacroApp(tk.Tk):
             # HWND_BOTTOM altera a ordem global do Windows e faz outros
             # programas aparecerem quando o editor de espera é aberto.
             user32.SetWindowPos(hwnd, 0, host.winfo_rootx(), host.winfo_rooty(), width, height, 0x0010 | 0x0040)
+            # Mostra sem ganhar foco. É importante depois de recuperar uma
+            # reserva que havia sido escondida pelo painel anterior.
+            user32.ShowWindow(wintypes.HWND(hwnd), 8)  # SW_SHOWNA
             self.grid_scrcpy_windows[serial] = hwnd
+            self.warm_scrcpy_windows[serial] = hwnd
+            self.grid_scrcpy_recovery_attempts.pop(serial, None)
             if callable(on_ready):
                 on_ready()
             if serial in self.grid_marker_windows:
@@ -3777,6 +4582,37 @@ class MacroApp(tk.Tk):
         except (AttributeError, OSError, tk.TclError):
             return
 
+    def _recover_grid_live_view(self, serial: str, session: int) -> None:
+        """Recria somente a tela que não chegou a formar janela SDL."""
+        if (session != self.grid_view_session or not getattr(self, "app_view_var", None)
+                or self.app_view_var.get() != "celulares"):
+            return
+        attempts = self.grid_scrcpy_recovery_attempts.get(serial, 0)
+        if attempts >= 2:
+            label = self.device_grid_screen_labels.get(serial)
+            if label and label.winfo_exists():
+                label.configure(text="Não foi possível iniciar esta tela. Atualize para tentar novamente.", image="")
+            return
+        self.grid_scrcpy_recovery_attempts[serial] = attempts + 1
+        process = self.grid_scrcpy_processes.pop(serial, None)
+        warm_process = self.warm_scrcpy_processes.pop(serial, None)
+        self.grid_scrcpy_windows.pop(serial, None)
+        self.warm_scrcpy_windows.pop(serial, None)
+        for candidate in {item for item in (process, warm_process) if item is not None}:
+            try:
+                if candidate.poll() is None:
+                    candidate.terminate()
+            except OSError:
+                pass
+        profile = next((item for item in self.device_profiles.values()
+                        if str(item.get("serial", "")) == str(serial)
+                        and item.get("state") == "device"), None)
+        if profile:
+            # A nova tentativa é exclusiva deste cartão: os celulares que já
+            # exibem vídeo não são reiniciados nem esperam por ele.
+            self.after(350, lambda current=dict(profile), token=session:
+                       self._start_grid_live_views([current], token))
+
     def _poll_grid_live_view_position(self, serial: str, process_id: int, session: int) -> None:
         """Mantém a janela scrcpy colada ao seu cartão mesmo durante a rolagem."""
         key = (serial, process_id, session)
@@ -3792,15 +4628,39 @@ class MacroApp(tk.Tk):
         self._place_grid_live_view(serial, process_id, session)
         self.after(80, lambda item=key: self._poll_grid_live_view_position(*item))
 
-    def _stop_grid_live_views(self) -> None:
+    def _stop_grid_live_views(self, terminate: bool = True) -> None:
         """Fecha as telas simultâneas da grade sem mexer na visualização do Fluxo."""
         self.grid_capture_stop.set()
         self.grid_live_position_pollers.clear()
         self._hide_grid_markers()
+        # Se a troca ocorreu com Ctrl/Alt pressionado, restaura o estilo da
+        # janela antes de ocultÃ¡-la. Limpar somente o mapa deixava o scrcpy
+        # transparente a cliques quando voltava para o Fluxo.
+        try:
+            user32 = ctypes.windll.user32
+            for serial, style in tuple(self.grid_scrcpy_original_exstyles.items()):
+                hwnd = int(self.grid_scrcpy_windows.get(serial, 0) or 0)
+                if hwnd:
+                    user32.SetWindowLongPtrW(wintypes.HWND(hwnd), -20, int(style))
+        except (AttributeError, OSError):
+            pass
         self.grid_scrcpy_original_exstyles.clear()
         processes = list(getattr(self, "grid_scrcpy_processes", {}).values())
         self.grid_scrcpy_processes.clear()
         self.grid_scrcpy_windows.clear()
+        self.grid_scrcpy_recovery_attempts.clear()
+        if not terminate:
+            for process in processes:
+                if process.poll() is None:
+                    hwnd = self._window_for_process(process.pid, include_hidden=True)
+                    if hwnd:
+                        try:
+                            ctypes.windll.user32.SetWindowPos(
+                                wintypes.HWND(hwnd), 0, -32000, -32000, 2, 2, 0x0010 | 0x0040
+                            )
+                        except (AttributeError, OSError):
+                            pass
+            return
         for process in processes:
             if process.poll() is not None:
                 continue
@@ -3814,6 +4674,122 @@ class MacroApp(tk.Tk):
                     pass
             except OSError:
                 continue
+
+    def _dispose_disconnected_live_view(self, serial: str) -> None:
+        """Remove exclusivamente a reserva e a janela do aparelho que saiu.
+
+        A atualização da lista não pode usar a limpeza geral da grade: ela
+        também contém as janelas saudáveis que continuam conectadas. Cada
+        serial possui uma única reserva, podendo estar na prévia do Fluxo ou
+        em um cartão de Celulares; por isso todos os mapas são reconciliados
+        aqui antes de reconstruir somente os widgets Tk da lista.
+        """
+        serial = str(serial or "")
+        if not serial:
+            return
+        self.warm_scrcpy_queue = [item for item in self.warm_scrcpy_queue if item != serial]
+        self.warm_scrcpy_retry_pending.discard(serial)
+        self.warm_scrcpy_retry_attempts.pop(serial, None)
+        self.grid_scrcpy_recovery_attempts.pop(serial, None)
+        self._hide_grid_marker(serial)
+        self.grid_marker_selected_items.pop(serial, None)
+        self.grid_xml_marker_bounds.pop(serial, None)
+        self.grid_xml_inspection_serial = "" if self.grid_xml_inspection_serial == serial else self.grid_xml_inspection_serial
+
+        grid_hwnd = int(self.grid_scrcpy_windows.pop(serial, 0) or 0)
+        warm_hwnd = int(self.warm_scrcpy_windows.pop(serial, 0) or 0)
+        original_style = self.grid_scrcpy_original_exstyles.pop(serial, None)
+        if original_style is not None and grid_hwnd:
+            try:
+                ctypes.windll.user32.SetWindowLongPtrW(wintypes.HWND(grid_hwnd), -20, int(original_style))
+            except (AttributeError, OSError):
+                pass
+
+        candidates = [
+            self.grid_scrcpy_processes.pop(serial, None),
+            self.warm_scrcpy_processes.pop(serial, None),
+        ]
+        is_primary = str(self.scrcpy_serial or "") == serial
+        if is_primary:
+            candidates.append(self.scrcpy_process)
+            self.live_view_session += 1
+            self.live_view_mode = False
+            self.live_view_edit_mode = False
+            self.live_view_uses_warm_pool = False
+            self._live_ctrl_record_start = None
+            self._live_ctrl_record_mouse_down = False
+            self._set_scrcpy_alt_passthrough(False)
+            self._hide_live_touch_marker()
+            self.scrcpy_process = None
+            self.scrcpy_window_handle = 0
+            self.scrcpy_window_title = ""
+            self.scrcpy_window_bounds = None
+            self.scrcpy_client_bounds = None
+            self.scrcpy_serial = ""
+            if getattr(self, "app_view_var", None) and self.app_view_var.get() == "fluxo":
+                self._set_preview_message("O celular foi desconectado")
+
+        for hwnd in {grid_hwnd, warm_hwnd}:
+            if hwnd:
+                try:
+                    ctypes.windll.user32.ShowWindow(wintypes.HWND(hwnd), 0)
+                except (AttributeError, OSError):
+                    pass
+        terminated: set[int] = set()
+        for process in candidates:
+            if not process or process.poll() is not None or process.pid in terminated:
+                continue
+            terminated.add(process.pid)
+            try:
+                process.terminate()
+            except OSError:
+                continue
+            try:
+                subprocess.Popen(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except OSError:
+                pass
+
+        # Se o scrcpy caiu sozinho quando o cabo saiu, seu cliente ADB pode
+        # sobreviver sem pai. Um novo scrcpy então chega a iniciar, porém pode
+        # disputar o servidor antigo no próprio celular e nunca entregar o
+        # vídeo ao cartão. Removemos apenas esses ADBs órfãos: clientes cujo
+        # pai ainda é um scrcpy seguem intactos, inclusive os de outros apps.
+        self.after(220, lambda target=serial: self._cleanup_orphaned_scrcpy_adb(target))
+
+    def _cleanup_orphaned_scrcpy_adb(self, serial: str) -> None:
+        """Encerra ADBs de scrcpy sem processo-pai, restritos a um serial."""
+        if getattr(self, "_closing_now", False) or not serial:
+            return
+        escaped = str(serial).replace("'", "''")
+        script = (
+            "$all = Get-CimInstance Win32_Process; "
+            "$byPid = @{}; foreach ($item in $all) { $byPid[[int]$item.ProcessId] = $item }; "
+            f"$targets = $all | Where-Object {{ $_.Name -eq 'adb.exe' -and $_.CommandLine -like '*{escaped}*' "
+            "-and $_.CommandLine -like '*com.genymobile.scrcpy.Server*' "
+            "-and (-not $byPid.ContainsKey([int]$_.ParentProcessId) "
+            "-or $byPid[[int]$_.ParentProcessId].Name -ne 'scrcpy.exe') }; "
+            "$targets | Select-Object -ExpandProperty ProcessId"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, text=True, timeout=1.5, creationflags=NO_CONSOLE,
+            )
+            for value in result.stdout.splitlines():
+                if not value.strip().isdigit():
+                    continue
+                subprocess.Popen(
+                    ["taskkill", "/PID", value.strip(), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=NO_CONSOLE,
+                )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _close_orphaned_scrcpy_views(self, wait: bool = False) -> None:
         """Fecha somente scrcpy iniciado por esta instância do Iggents.
@@ -3850,30 +4826,73 @@ class MacroApp(tk.Tk):
             return
         if view == "celulares":
             self.stop_live_view()
-            self._close_orphaned_scrcpy_views()
             for widget in self._editor_root_widgets:
                 widget.pack_forget()
-            self.device_grid_view.pack(fill="both", expand=True, padx=60, pady=(0, 20))
             self.app_view_var.set("celulares")
-            # A atualização abaixo reconstruirá a grade quando a lista ADB
-            # chegar. Evita iniciar três vídeos e reiniciá-los logo em seguida.
-            self.refresh_devices(fast=True)
+            self.device_grid_view.pack(fill="both", expand=True, padx=22, pady=(0, 20))
+            # Os cartões são pré-montados quando os aparelhos são detectados.
+            # Não consulte ADB nem destrua/recrie a grade nesta troca: isso
+            # era justamente a espera percebida na primeira entrada e em cada
+            # retorno à aba. Caso a lista ainda não tenha chegado, fazemos a
+            # montagem local com os perfis que já existirem.
+            profiles = [item for item in self.device_profiles.values() if item.get("state") == "device"]
+            expected = {str(item.get("serial", "")) for item in profiles}
+            if expected and not expected.issubset(set(self.device_grid_hosts)):
+                self._refresh_device_grid()
+            self.update_idletasks()
+            if profiles:
+                self._start_grid_live_views(profiles, self.grid_view_session)
             self.view_flow_button.configure(fg_color="#2b3850")
             self.view_devices_button.configure(fg_color="#6d34bd")
         else:
-            self._stop_grid_live_views()
+            self._stop_grid_live_views(terminate=False)
             self.device_grid_view.pack_forget()
             for widget in self._editor_root_widgets:
                 info = self._editor_pack_info.get(widget)
                 if info:
                     widget.pack(**info)
             self.app_view_var.set("fluxo")
+            self._restore_grid_stage_context_in_flow()
             self._render_execution_state()
             self.view_flow_button.configure(fg_color="#6d34bd")
             self.view_devices_button.configure(fg_color="#2b3850")
-            selected = self.selected_profiles()
-            if len(selected) == 1 and selected[0].get("state") == "device":
-                self.after_idle(lambda serial=selected[0]["serial"]: self._start_live_view_when_preview_ready(serial))
+            # O telefone que já estava selecionado volta pela mesma reserva
+            # coletiva dos demais. Só depois de todas as telas estarem
+            # disponíveis a rotina final encaixa a escolhida na prévia.
+            self._prepare_all_device_visuals(list(self.device_profiles.values()))
+
+    def shortcut_show_app_view(self, view: str):
+        """Alterna de visualização pelos atalhos Ctrl+1 e Ctrl+2."""
+        self.show_app_view(view)
+        return "break"
+
+    def _restore_grid_stage_context_in_flow(self) -> None:
+        """Restaura no editor o telefone e as etapas escolhidas na grade."""
+        context = getattr(self, "grid_last_stage_context", {})
+        serial = str(context.get("serial", "")).strip()
+        panel = str(context.get("panel", "")).strip()
+        items = tuple(str(item) for item in context.get("items", ()) if item)
+        if not serial or not items:
+            return
+        if panel and panel != "__unassigned__" and self.flow_var.get() != panel:
+            self.select_flow(panel)
+        self._select_grid_device(serial)
+        available = [item for item in items if self.tree.exists(item)]
+        if not available:
+            return
+        focus = str(context.get("focus", ""))
+        if focus not in available:
+            focus = available[0]
+        # Um filho pode ter sido escolhido com o grupo recolhido no editor.
+        # Abrir seus ancestrais garante que ``see`` revele exatamente a etapa.
+        parent = self.tree.parent(focus)
+        while parent:
+            self.tree.item(parent, open=True)
+            parent = self.tree.parent(parent)
+        self.tree.selection_set(available)
+        self.tree.focus(focus)
+        self.tree.see(focus)
+        self.tree.focus_set()
 
     def _thread(self, target) -> threading.Thread:
         thread = threading.Thread(target=target, daemon=True)
@@ -4169,19 +5188,28 @@ class MacroApp(tk.Tk):
         self.action_drawer_open = False
 
     def _show_grid_action_drawer(self, serial: str, panel: str, tree: ttk.Treeview) -> None:
-        """Abre, dentro de Celulares, a lateral de ações para o cartão ativo."""
+        """Abre uma lista flutuante de ações, sempre no viewport visível."""
         if not self._grid_activate_tree_item(serial, panel, tree):
             self.status.set("Selecione uma etapa ou grupo no cartão antes de adicionar uma ação.")
             return
         old_drawer = getattr(self, "device_grid_action_drawer", None)
         if old_drawer and old_drawer.winfo_exists():
             old_drawer.destroy()
-        drawer = tk.Frame(self.device_grid_view, bg="#171b26", highlightthickness=1, highlightbackground="#6940a8")
+        # A grade vive dentro do Canvas rolável principal. Um Frame nela sai
+        # da área visível junto com os cartões; esta janela pertence ao app e
+        # fica posicionada no viewport, não no conteúdo rolável.
+        drawer = tk.Toplevel(self)
+        drawer.withdraw()
+        drawer.configure(bg="#171b26", highlightthickness=1, highlightbackground="#6940a8")
+        drawer.transient(self)
+        drawer.title("Adicionar etapa")
+        drawer.resizable(False, True)
+        # As telas scrcpy são janelas nativas de outro processo. Mantemos a
+        # ferramenta acima delas enquanto estiver aberta, sem escondê-las.
+        drawer.wm_attributes("-topmost", True)
+        drawer.protocol("WM_DELETE_WINDOW", self._close_grid_action_drawer)
         self.device_grid_action_drawer = drawer
-        drawer.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne", width=300)
-        drawer.lift()
-        # A busca de ações não é um diálogo modal: as telas dos celulares
-        # continuam visíveis e acompanhando a execução enquanto ela está aberta.
+        self._position_grid_action_drawer()
         top = tk.Frame(drawer, bg="#171b26"); top.pack(fill="x", padx=10, pady=(10, 7))
         tk.Label(top, text="Adicionar etapa", bg="#171b26", fg="#f1f5f9", font=("Segoe UI", 13, "bold")).pack(side="left")
         ctk.CTkButton(top, text="×", width=28, height=26, corner_radius=6, fg_color="#39455b",
@@ -4189,7 +5217,20 @@ class MacroApp(tk.Tk):
         query = tk.StringVar()
         entry = ctk.CTkEntry(drawer, textvariable=query, placeholder_text="Pesquisar etapa…", height=30)
         entry.pack(fill="x", padx=10, pady=(0, 8))
-        holder = tk.Frame(drawer, bg="#171b26"); holder.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        list_area = tk.Frame(drawer, bg="#171b26")
+        list_area.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        action_canvas = tk.Canvas(list_area, bg="#171b26", highlightthickness=0, borderwidth=0)
+        action_scroll = ttk.Scrollbar(list_area, orient="vertical", command=action_canvas.yview)
+        action_canvas.configure(yscrollcommand=action_scroll.set)
+        action_scroll.pack(side="right", fill="y")
+        action_canvas.pack(side="left", fill="both", expand=True)
+        holder = tk.Frame(action_canvas, bg="#171b26")
+        holder_window = action_canvas.create_window((0, 0), window=holder, anchor="nw")
+        holder.bind("<Configure>", lambda _event: action_canvas.configure(scrollregion=action_canvas.bbox("all")))
+        action_canvas.bind("<Configure>", lambda event: action_canvas.itemconfigure(holder_window, width=event.width))
+        for scroll_target in (action_canvas, holder, action_scroll):
+            scroll_target.bind("<MouseWheel>",
+                               lambda event, target=action_canvas: self._scroll_embedded_panel_widget(event, target), add="+")
         visible_actions = []
 
         def refresh(*_args) -> None:
@@ -4200,9 +5241,11 @@ class MacroApp(tk.Tk):
                 if needle and needle not in search_text:
                     continue
                 def add(command=invoke) -> None:
+                    # Fechar antes de abrir um diálogo de configuração evita
+                    # que a janela flutuante cubra esse próximo diálogo.
+                    self._close_grid_action_drawer()
                     command()
                     self._reload_compact_flow_tree(tree, serial, panel, getattr(tree, "grid_fallback_model", ""))
-                    self._close_grid_action_drawer()
                 visible_actions.append(add)
                 ttk.Button(holder, text=button.cget("text"), command=add).pack(fill="x", pady=2)
         def add_first(_event=None):
@@ -4210,7 +5253,26 @@ class MacroApp(tk.Tk):
                 visible_actions[0]()
             return "break"
         query.trace_add("write", refresh); entry.bind("<Return>", add_first); refresh()
+        self.bind("<Configure>", lambda _event: self._position_grid_action_drawer(), add="+")
+        drawer.deiconify()
+        self._position_grid_action_drawer()
         entry.focus_set()
+
+    def _position_grid_action_drawer(self) -> None:
+        """Centraliza a lista de etapas no viewport, independente da rolagem."""
+        drawer = getattr(self, "device_grid_action_drawer", None)
+        if not drawer or not drawer.winfo_exists():
+            return
+        try:
+            margin = 18
+            width = min(330, max(180, self.winfo_width() - margin * 2))
+            height = min(690, max(160, self.winfo_height() - margin * 2))
+            x = self.winfo_rootx() + max(margin, self.winfo_width() - width - margin)
+            y = self.winfo_rooty() + max(margin, (self.winfo_height() - height) // 2)
+            drawer.geometry(f"{width}x{height}+{x}+{y}")
+            drawer.lift()
+        except tk.TclError:
+            pass
 
     def _close_grid_action_drawer(self) -> None:
         drawer = getattr(self, "device_grid_action_drawer", None)
@@ -4429,7 +5491,7 @@ class MacroApp(tk.Tk):
     def _container_actions(self, action: Action) -> list[Action] | None:
         """Normaliza e devolve as etapas internas de qualquer tipo de grupo."""
         field = ("nested_actions" if action.kind == "subgroup" else
-                 "branch_actions" if action.kind in ("xml_logic", "xml_any_tap") else
+                 "branch_actions" if action.kind in ("xml_logic", "xml_any_tap", "xml_list") else
                  "nav_rc_actions" if action.kind == "navigate_rc" else
                  "nav_actions" if action.kind in ("navigate_r", "navigate_s") else None)
         if field is None:
@@ -4645,6 +5707,9 @@ class MacroApp(tk.Tk):
             if action.kind == "xml_any_tap":
                 self.add_xml_any_tap_group(action_override=action, tree_item=selected[0])
                 return
+            if action.kind == "xml_list":
+                self.add_xml_list_action(action_override=action, tree_item=selected[0])
+                return
             if action.kind == "subgroup":
                 self.configure_subgroup_action(group_index, action_index, action_override=action, tree_item=selected[0])
                 return
@@ -4666,6 +5731,9 @@ class MacroApp(tk.Tk):
                 # A automação do PC pode estar em qualquer profundidade.
                 # Editá-la por índice do grupo principal quebra em subgrupos.
                 self.add_pc_automation_action(action_override=action, tree_item=selected[0])
+                return
+            if action.kind == "browser_invite":
+                self.configure_browser_invite_action(action, selected[0])
                 return
             messagebox.showwarning("Configurar", "Esta etapa interna não possui configuração própria. Use F5 para variações ou edite a espera na coluna.", parent=self)
             return
@@ -4707,6 +5775,9 @@ class MacroApp(tk.Tk):
             if action.kind == "xml_any_tap":
                 self.add_xml_any_tap_group(action_override=action, tree_item=selected[0])
                 return
+            if action.kind == "xml_list":
+                self.add_xml_list_action(action_override=action, tree_item=selected[0])
+                return
             if action.kind == "nav_rc_type":
                 self.configure_nav_rc_type_action(group_index, action_index)
                 return
@@ -4718,6 +5789,9 @@ class MacroApp(tk.Tk):
                 return
             if action.kind in ("pc_automation", "pc_copy_link_to_phone"):
                 self.add_pc_automation_action(action_ref=(group_index, action_index))
+                return
+            if action.kind == "browser_invite":
+                self.configure_browser_invite_action(action, selected[0])
                 return
             if action.kind in ("instagram_ready", "launch_app") and (action.package_name or "com.instagram.android") == "com.instagram.android":
                 self.configure_instagram_action(group_index, action_index)
@@ -5424,7 +6498,7 @@ class MacroApp(tk.Tk):
             return
         timeout = simpledialog.askfloat(
             "Validar número", "Verificar por quantos segundos ao fim de cada ciclo?",
-            initialvalue=max(0.1, float(existing.get("validation_loop_timeout_s", 3))), minvalue=0.1, maxvalue=120, parent=self,
+            initialvalue=max(0.1, float(existing.get("validation_loop_timeout_s", 10))), minvalue=0.1, maxvalue=120, parent=self,
         )
         if timeout is None:
             return
@@ -5543,7 +6617,7 @@ class MacroApp(tk.Tk):
                 if special_index is None:
                     normalized.append(Action("xml_logic", label="Rota especial XML", selector_type=special_selector_type,
                                              selector_value=special_query.strip(), selector_blocked_text=special_blocked.strip(),
-                                             timeout_s=1, delay_ms=0, branch_actions=[]))
+                                             timeout_s=10, delay_ms=0, branch_actions=[]))
                 else:
                     special = normalized[special_index]
                     special.selector_type = special_selector_type
@@ -5579,7 +6653,7 @@ class MacroApp(tk.Tk):
             special_actions = []
             if special_query.strip():
                 special_actions.append(Action("xml_logic", label="Rota especial XML", selector_type=special_selector_type, selector_value=special_query.strip(),
-                                              selector_blocked_text=special_blocked.strip(), timeout_s=1, delay_ms=0,
+                                              selector_blocked_text=special_blocked.strip(), timeout_s=10, delay_ms=0,
                                               branch_actions=[]))
             groups.append({**config, "actions": special_actions})
             group_index = len(groups) - 1
@@ -5716,7 +6790,7 @@ class MacroApp(tk.Tk):
             return str(previous.get(group_keys[key] if editing else key, default))
         values = {
             "name": tk.StringVar(value=str(existing.get("name", f"Nav-S {sum(bool(g.get('navigation_s')) for g in groups_for_flow) + 1}"))),
-            "verify_timeout": tk.StringVar(value=last("verify_timeout", "3")),
+            "verify_timeout": tk.StringVar(value=last("verify_timeout", "10")),
             "min_s": tk.StringVar(value=last("min_s", "12")), "max_s": tk.StringVar(value=last("max_s", "20")),
             "pause_min": tk.StringVar(value=last("pause_min", "350")), "pause_max": tk.StringVar(value=last("pause_max", "750")),
             "tap_interval_min": tk.StringVar(value=last("tap_interval_min", "120")), "tap_interval_max": tk.StringVar(value=last("tap_interval_max", "250")),
@@ -6026,6 +7100,10 @@ class MacroApp(tk.Tk):
             self.active_group = int(parts[1])
         self.update_action_preview(parts)
         self._update_live_touch_marker()
+        # O scrcpy Ã© uma janela nativa e pode concluir um resize depois do
+        # evento da Ã¡rvore. Uma segunda passagem curta impede que ela fique
+        # por cima da mÃ¡scara recÃ©m-selecionada.
+        self.after(45, self._update_live_touch_marker)
         self._render_execution_state()
 
     def toggle_selected_tree_groups(self, _event=None):
@@ -6135,7 +7213,666 @@ class MacroApp(tk.Tk):
 
         return [convert(action) for action in actions]
 
-    def start_live_view(self, preferred_serial: str | None = None, coordinate_edit: bool = False) -> None:
+    def _retry_warm_live_view(self, serial: str) -> None:
+        """Repete a reserva que falhou ao abrir, sem duplicar o serial."""
+        serial = str(serial)
+        if not serial or serial in self.warm_scrcpy_retry_pending:
+            return
+        attempt = self.warm_scrcpy_retry_attempts.get(serial, 0)
+        # O sexto servidor scrcpy pode receber uma resposta transitória do ADB
+        # durante a subida simultânea. Três tentativas faziam justamente o
+        # último aparelho (com frequência o já selecionado) sumir da reserva
+        # para o restante daquela abertura.
+        if attempt >= 8:
+            return
+        self.warm_scrcpy_retry_attempts[serial] = attempt + 1
+        self.warm_scrcpy_retry_pending.add(serial)
+
+        def retry() -> None:
+            self.warm_scrcpy_retry_pending.discard(serial)
+            if getattr(self, "_closing_now", False):
+                return
+            current = self.warm_scrcpy_processes.get(serial)
+            if current and current.poll() is None:
+                return
+            connected = any(
+                str(profile.get("serial", "")) == serial and profile.get("state") == "device"
+                for profile in self.device_profiles.values()
+            )
+            if connected and serial not in self.warm_scrcpy_queue:
+                self.warm_scrcpy_queue.append(serial)
+                self._start_next_warm_live_view()
+
+        self.after(350 * (attempt + 1), retry)
+
+    @staticmethod
+    def _trace_scrcpy_recovery(serial: str, detail: str) -> None:
+        """Registro curto para diagnosticar reconexões que fecham o scrcpy."""
+        try:
+            stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            with (RUNTIME_DIR / f"scrcpy_recovery_{serial}.log").open("a", encoding="utf-8") as log:
+                log.write(f"[{stamp}] {detail}\n")
+        except OSError:
+            pass
+
+    def _set_device_visual_pool_loading(self, loading: bool) -> None:
+        """Esconde a lista até todas as reservas visuais ficarem prontas."""
+        if not hasattr(self, "device_list_content"):
+            return
+        self.device_visual_pool_loading = bool(loading)
+        if loading:
+            self.device_list_content.place_forget()
+            if not hasattr(self, "device_visual_pool_notice"):
+                self.device_visual_pool_notice = tk.Label(
+                    self.device_area, bg="#111925", fg="#aebbd0",
+                    font=("Segoe UI", 10),
+                    text="Preparando as telas de todos os celulares…",
+                )
+            self.device_visual_pool_notice.place(x=0, y=0, relwidth=1, height=112)
+            if hasattr(self, "view_devices_button"):
+                self.view_devices_button.configure(state="disabled")
+            return
+        if hasattr(self, "device_visual_pool_notice"):
+            self.device_visual_pool_notice.place_forget()
+        self.device_list_content.place(x=0, y=0, relwidth=1, height=112)
+        if hasattr(self, "view_devices_button"):
+            self.view_devices_button.configure(state="normal")
+
+    def _prepare_all_device_visuals(self, profiles: list[dict]) -> None:
+        """Só libera a lista quando todo serial conectado tem sua janela SDL."""
+        if not getattr(self, "app_view_var", None) or self.app_view_var.get() != "fluxo":
+            return
+        profiles_by_serial = {
+            str(profile.get("serial", "")): profile for profile in profiles
+            if profile.get("state") == "device" and str(profile.get("serial", ""))
+        }
+        # The Tk list can be between rebuilds while the cable watcher runs.
+        # Reserve from the ADB-connected serial set, never from a transient
+        # selection or a partially rebuilt list.
+        try:
+            adb_connected = {str(serial) for serial, state in self.adb.devices() if state == "device"}
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            adb_connected = set()
+        for serial in adb_connected:
+            profiles_by_serial.setdefault(serial, {"serial": serial, "state": "device"})
+        profiles = list(profiles_by_serial.values())
+        expected = {
+            str(profile.get("serial", "")) for profile in profiles
+            if profile.get("state") == "device" and str(profile.get("serial", ""))
+        }
+        # Uma prévia que sobreviveu à reconstrução da interface também é a
+        # reserva desse serial. Registrá-la antes de montar a fila impede que
+        # o telefone já selecionado seja tratado como uma tela separada.
+        primary = self.scrcpy_process
+        primary_serial = str(self.scrcpy_serial or "")
+        if (primary_serial in expected and primary is not None
+                and primary.poll() is None
+                and self._scrcpy_process_matches_serial(primary, primary_serial)):
+            self.warm_scrcpy_processes[primary_serial] = primary
+            hwnd = int(self.scrcpy_window_handle or 0)
+            if not self._window_belongs_to_process(hwnd, primary.pid):
+                hwnd = self._window_for_process(primary.pid, include_hidden=True)
+            if hwnd:
+                self.warm_scrcpy_windows[primary_serial] = hwnd
+
+        expected_changed = expected != self.device_visual_pool_expected
+        self.device_visual_pool_expected = expected
+        # Atualizações repetidas durante o início não podem reiniciar a
+        # contagem e deixar a tela de preparação presa indefinidamente.
+        if expected_changed or not self.device_visual_pool_loading:
+            self.device_visual_pool_started_at = time.monotonic()
+        if not expected:
+            self._set_device_visual_pool_loading(False)
+            return
+        self._set_device_visual_pool_loading(True)
+        self._warm_connected_live_views(profiles)
+        if not self.device_visual_pool_wait_scheduled:
+            self.device_visual_pool_wait_scheduled = True
+            self.after(100, self._finish_device_visual_pool_when_ready)
+
+    def _finish_device_visual_pool_when_ready(self) -> None:
+        self.device_visual_pool_wait_scheduled = False
+        if (not getattr(self, "app_view_var", None) or self.app_view_var.get() != "fluxo"
+                or getattr(self, "_closing_now", False)):
+            return
+        expected = set(self.device_visual_pool_expected)
+        ready = True
+        for serial in expected:
+            process = self.warm_scrcpy_processes.get(serial)
+            if process and not self._scrcpy_process_matches_serial(process, serial):
+                self.warm_scrcpy_processes.pop(serial, None)
+                self.warm_scrcpy_windows.pop(serial, None)
+                process = None
+            if (not process or process.poll() is not None) and str(self.scrcpy_serial or "") == serial:
+                primary = self.scrcpy_process
+                if (primary is not None and primary.poll() is None
+                        and self._scrcpy_process_matches_serial(primary, serial)):
+                    process = primary
+                    self.warm_scrcpy_processes[serial] = primary
+            if not process or process.poll() is not None:
+                ready = False
+                continue
+            hwnd = self._window_for_process(process.pid, include_hidden=True)
+            if not hwnd:
+                ready = False
+                continue
+            self.warm_scrcpy_windows[serial] = hwnd
+        if not ready:
+            profiles = [profile for profile in self.device_profiles.values()
+                        if str(profile.get("serial", "")) in expected]
+            self._warm_connected_live_views(profiles)
+            elapsed = time.monotonic() - self.device_visual_pool_started_at
+            # Reconciliação obrigatória: a primeira rodada de abertura pode
+            # perder um item ao reconstruir a lista. Todo serial conectado que
+            # ainda não possui um processo scrcpy próprio volta para a fila;
+            # não confiamos apenas na primeira programação da fila.
+            missing_processes = []
+            for serial in expected:
+                candidate = self.warm_scrcpy_processes.get(serial)
+                if (candidate is None or candidate.poll() is not None
+                        or not self._scrcpy_process_matches_serial(candidate, serial)):
+                    self.warm_scrcpy_processes.pop(serial, None)
+                    self.warm_scrcpy_windows.pop(serial, None)
+                    self.warm_scrcpy_retry_pending.discard(serial)
+                    if serial not in self.warm_scrcpy_queue:
+                        self.warm_scrcpy_queue.append(serial)
+                    missing_processes.append(serial)
+            if missing_processes and not self.warm_scrcpy_starting:
+                self.after(0, self._start_next_warm_live_view)
+            # Com um único telefone conectado não existe outra reserva a
+            # aguardar. Se a fila não criou a janela em alguns segundos,
+            # liberamos somente esse serial para o caminho direto, que vira a
+            # sua reserva normal em seguida. Isso cobre exatamente o caso do
+            # Note 12 sem mudar o carregamento coletivo com vários celulares.
+            if len(expected) == 1 and elapsed >= 5:
+                serial = next(iter(expected))
+                process = self.warm_scrcpy_processes.get(serial)
+                if not process or process.poll() is not None:
+                    self.warm_scrcpy_processes.pop(serial, None)
+                    self.warm_scrcpy_windows.pop(serial, None)
+                    self.warm_scrcpy_queue = [item for item in self.warm_scrcpy_queue if item != serial]
+                    self.warm_scrcpy_retry_pending.discard(serial)
+                    self.warm_scrcpy_starting_serials.discard(serial)
+                    self._set_device_visual_pool_loading(False)
+                    self.after_idle(lambda target=serial:
+                                    self._start_live_view_when_preview_ready(target))
+                    return
+            # Readiness is all-or-nothing: retry the affected serial instead
+            # of releasing a partial list after an arbitrary timeout.
+            self.device_visual_pool_wait_scheduled = True
+            self.after(120, self._finish_device_visual_pool_when_ready)
+            return
+        # A prévia inicial tem de passar pela mesma seleção que um clique na
+        # lista. Antes, se já houvesse uma seleção preservada enquanto a lista
+        # era reconstruída, o telefone restaurado podia ficar apenas como
+        # reserva e nunca receber o encaixe final.
+        selected = self.selected_profiles()
+        remembered = self._last_selected_device_for_panel()
+        selected_serial = (
+            str(selected[0].get("serial", ""))
+            if len(selected) == 1 and selected[0].get("state") == "device"
+            else ""
+        )
+        target = remembered if remembered in expected else selected_serial
+        if target not in expected:
+            target = next(iter(expected), "")
+        if not target:
+            self._set_device_visual_pool_loading(False)
+            return
+        for index in range(self.device_list.size()):
+            profile = self.device_profiles.get(self.device_list.get(index), {})
+            if str(profile.get("serial", "")) != target:
+                continue
+            self.device_list.selection_clear(0, tk.END)
+            self.device_list.selection_set(index)
+            self.device_list.activate(index)
+            self.device_list.see(index)
+            self._set_device_visual_pool_loading(False)
+            # Esta é a mesma rotina acionada pelo clique do usuário. Só ela
+            # agenda o encaixe, depois da reserva daquele serial estar pronta.
+            self.populate_profile()
+            # Na abertura, a lista pode restaurar a seleção antes de a janela
+            # SDL deste mesmo serial existir. A rotina abaixo espera somente a
+            # reserva do telefone escolhido (não a dos demais) e então força o
+            # encaixe da prévia. Antes ela existia, mas não era chamada aqui.
+            self.after_idle(lambda target=target:
+                            self._start_initial_live_view_when_pool_ready(target))
+            return
+        self._set_device_visual_pool_loading(False)
+
+    def _warm_pool_is_ready(self, profiles: list[dict]) -> bool:
+        """Confirma uma janela SDL preparada para cada celular conectado."""
+        for profile in profiles:
+            if profile.get("state") != "device":
+                continue
+            serial = str(profile.get("serial", ""))
+            process = self.warm_scrcpy_processes.get(serial)
+            if not process or process.poll() is not None:
+                return False
+            hwnd = int(self.warm_scrcpy_windows.get(serial, 0) or 0)
+            if not hwnd:
+                return False
+        return True
+
+    def _start_initial_live_view_when_pool_ready(self, serial: str, attempt: int = 0) -> None:
+        """Fixa a prévia já selecionada assim que a reserva dela estiver pronta."""
+        if not getattr(self, "app_view_var", None) or self.app_view_var.get() != "fluxo":
+            return
+        # A lista pode ter restaurado a seleção persistida enquanto as janelas
+        # eram preparadas. Use a escolha atual agora, não o primeiro serial
+        # que existia quando a abertura começou.
+        selected = self.selected_profiles()
+        current = (str(selected[0].get("serial", ""))
+                   if len(selected) == 1 and selected[0].get("state") == "device"
+                   else str(serial))
+        if not current:
+            return
+        process = self.warm_scrcpy_processes.get(current)
+        hwnd = (int(self.warm_scrcpy_windows.get(current, 0) or 0)
+                if process and process.poll() is None else 0)
+        if not hwnd and process and process.poll() is None:
+            hwnd = self._window_for_process(process.pid, include_hidden=True)
+            if hwnd:
+                self.warm_scrcpy_windows[current] = hwnd
+        # Só a reserva do celular selecionado importa aqui. Esperar todos os
+        # seis fazia a prévia inicial nunca aparecer quando um outro aparelho
+        # demorava a criar sua própria janela.
+        if not hwnd:
+            if attempt < 100:
+                self.after(100, lambda target=current, count=attempt + 1:
+                           self._start_initial_live_view_when_pool_ready(target, count))
+            return
+        # A reserva do scrcpy pode estar pronta antes de o Tk terminar de
+        # desenhar o quadro da prévia na abertura. Chamar ``start_live_view``
+        # diretamente nesse instante deixa a janela SDL fora do painel (e
+        # visível na barra de tarefas) até um clique manual. Passe sempre pelo
+        # verificador do quadro, exatamente como o clique da lista faz.
+        self._start_live_view_when_preview_ready(current)
+
+    def _queue_warm_live_view(self, serial: str) -> None:
+        """Request one shared scrcpy reservation for ``serial``.
+
+        This is deliberately the only path that queues a new process.  A
+        reservation is identified by its immutable ``--serial`` argument, not
+        by a window title or by whichever panel requested it.
+        """
+        serial = str(serial or "")
+        if not serial:
+            return
+        process = self.warm_scrcpy_processes.get(serial)
+        if process and self._scrcpy_process_matches_serial(process, serial):
+            if process.poll() is None:
+                return
+            self.warm_scrcpy_processes.pop(serial, None)
+            self.warm_scrcpy_windows.pop(serial, None)
+        if (serial not in self.warm_scrcpy_queue
+                and serial not in self.warm_scrcpy_starting_serials
+                and serial not in self.warm_scrcpy_retry_pending):
+            self.warm_scrcpy_queue.append(serial)
+            self._trace_scrcpy_recovery(serial, "enfileirado")
+        if not self.warm_scrcpy_starting:
+            self.after(0, self._start_next_warm_live_view)
+
+    def _scrcpy_port_for_serial(self, serial: str) -> int:
+        """Return a stable, exclusive local scrcpy tunnel port per serial."""
+        serial = str(serial)
+        existing = self.warm_scrcpy_ports.get(serial)
+        if existing:
+            return existing
+        used = set(self.warm_scrcpy_ports.values())
+        for port in range(27183, 27200):
+            if port not in used:
+                self.warm_scrcpy_ports[serial] = port
+                return port
+        raise RuntimeError("Não há porta scrcpy disponível para outro celular.")
+
+    def _warm_connected_live_views(self, profiles: list[dict]) -> None:
+        """Prepara uma reserva oculta para cada telefone conectado."""
+        if not getattr(self, "app_view_var", None) or self.app_view_var.get() != "fluxo":
+            return
+        # Só exclua a prévia se ela ainda tiver um processo vivo. O serial
+        # selecionado pode sobreviver no estado após um scrcpy encerrar; usar
+        # somente ``scrcpy_serial`` nesse caso pulava justamente aquele
+        # telefone da pré-carga e deixava a barreira esperando para sempre.
+        active_primary = self.scrcpy_process
+        primary_serial = (
+            str(self.scrcpy_serial or "")
+            if (active_primary is not None and active_primary.poll() is None
+                and self.live_view_mode
+                and self._scrcpy_process_matches_serial(active_primary, str(self.scrcpy_serial or "")))
+            else ""
+        )
+        if primary_serial:
+            # A prévia ativa é uma reserva válida do mesmo serial. Mantém
+            # exatamente um processo por celular, inclusive na inicialização.
+            self.warm_scrcpy_processes[primary_serial] = active_primary
+            hwnd = int(self.scrcpy_window_handle or 0)
+            if not self._window_belongs_to_process(hwnd, active_primary.pid):
+                hwnd = self._window_for_process(active_primary.pid, include_hidden=True)
+            if hwnd:
+                self.warm_scrcpy_windows[primary_serial] = hwnd
+        for profile in profiles:
+            if profile.get("state") != "device":
+                continue
+            serial = str(profile.get("serial", ""))
+            # A prévia já visível não precisa de uma segunda reserva; os
+            # demais, inclusive o celular apenas selecionado, são preparados.
+            # Mesmo a prévia atual passa por esta verificação. Se ela já tiver
+            # processo próprio, ``current`` abaixo impede duplicata; excluí-la
+            # aqui fazia justamente o último/selecionado nunca entrar na fila.
+            if not serial:
+                continue
+            current = self.warm_scrcpy_processes.get(serial)
+            if current and not self._scrcpy_process_matches_serial(current, serial):
+                self.warm_scrcpy_processes.pop(serial, None)
+                self.warm_scrcpy_windows.pop(serial, None)
+                current = None
+            if not (current and current.poll() is None):
+                self._queue_warm_live_view(serial)
+        # Cada sessão segue independente depois de iniciada. Só espaçamos as
+        # criações para não tentar instalar seis servidores scrcpy no mesmo
+        # instante no ADB/USB — cenário em que o último processo podia fechar
+        # antes de criar sua janela, embora o telefone estivesse conectado.
+        # A transmissão e a execução seguem paralelas; apenas a criação do
+        # servidor scrcpy é sequencial. A verificação da barreira chama esta
+        # rotina várias vezes por segundo; agendar a fila inteira em cada uma
+        # dessas chamadas anulava qualquer espaçamento e deixava um telefone
+        # aleatório sem janela SDL.
+        if self.warm_scrcpy_queue and not self.warm_scrcpy_starting:
+            self.after(0, self._start_next_warm_live_view)
+
+    def _warm_uiautomator2_servers(self, profiles: list[dict]) -> None:
+        """Inicia em fila os servidores XML dos telefones conectados."""
+        connected = {
+            str(profile.get("serial", "")) for profile in profiles
+            if profile.get("state") == "device" and str(profile.get("serial", ""))
+        }
+        self.uiautomator2_ready_serials.intersection_update(connected)
+        self.uiautomator2_start_queue = [
+            serial for serial in self.uiautomator2_start_queue if serial in connected
+        ]
+        if self.uiautomator2_starting_serial and self.uiautomator2_starting_serial not in connected:
+            self.uiautomator2_starting_serial = ""
+        for serial in sorted(connected):
+            if (serial not in self.uiautomator2_ready_serials
+                    and serial != self.uiautomator2_starting_serial
+                    and serial not in self.uiautomator2_start_queue):
+                self.uiautomator2_start_queue.append(serial)
+        self._start_next_uiautomator2_server()
+
+    def _start_next_uiautomator2_server(self) -> None:
+        if self.uiautomator2_starting_serial or not self.uiautomator2_start_queue:
+            return
+        serial = self.uiautomator2_start_queue.pop(0)
+        self.uiautomator2_starting_serial = serial
+
+        def start_server(target: str = serial) -> None:
+            error_text = ""
+            try:
+                adb = Adb()
+                adb.path, adb.serial = self.adb.path, target
+                adb.ensure_uiautomator2_server(timeout=15)
+            except Exception as error:
+                error_text = str(error)
+            self.events.put(("uiautomator2_server", (target, error_text)))
+
+        self._thread(start_server)
+
+    def _start_next_warm_live_view(self) -> None:
+        if self.warm_scrcpy_starting:
+            return
+        if not self.warm_scrcpy_queue:
+            return
+        executable = APP_DIR / "tools" / "scrcpy" / "scrcpy-win64-v4.1" / "scrcpy.exe"
+        if not executable.exists():
+            return
+        # A grade pode ter assumido uma reserva que ainda constava na fila.
+        # Revalide aqui, imediatamente antes de abrir o processo, para nunca
+        # criar um segundo scrcpy para o mesmo telefone.
+        serial = ""
+        while self.warm_scrcpy_queue:
+            candidate = self.warm_scrcpy_queue.pop(0)
+            current = self.warm_scrcpy_processes.get(candidate)
+            if (current and current.poll() is None
+                    and self._scrcpy_process_matches_serial(current, candidate)):
+                continue
+            if current and not self._scrcpy_process_matches_serial(current, candidate):
+                self.warm_scrcpy_processes.pop(candidate, None)
+                self.warm_scrcpy_windows.pop(candidate, None)
+            serial = candidate
+            break
+        if not serial:
+            return
+        self._trace_scrcpy_recovery(serial, "iniciando processo")
+        self.warm_scrcpy_starting_serials.add(serial)
+        self.warm_scrcpy_starting = True
+        port = self._scrcpy_port_for_serial(serial)
+        # Creating the sixth scrcpy can block in Windows/ADB.  Never perform
+        # that operation on Tk's event thread: it prevented the final queued
+        # serial from ever being dispatched.
+        def launch_in_worker(target=serial, tunnel_port=port) -> None:
+            # Quando uma conexão recém-restaurada fecha antes de criar a SDL,
+            # o scrcpy só explica a razão no stderr. Registrar por serial
+            # permite recuperar esse caso sem travar a interface nem abrir
+            # uma janela de console.
+            log_path = RUNTIME_DIR / f"scrcpy_{target}.log"
+            try:
+                with log_path.open("ab") as log_file:
+                    process = subprocess.Popen(
+                        [str(executable), f"--serial={target}", f"--port={tunnel_port}", "--force-adb-forward",
+                         "--window-title", f"iggents pronto {target}",
+                         "--window-borderless", "--window-x", "-32000", "--window-y", "-32000", "--no-audio",
+                         "--max-size=540", "--max-fps=20", "--video-bit-rate=2M", "--render-driver=opengl"],
+                        cwd=str(executable.parent), stdout=log_file, stderr=log_file,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), startupinfo=None,
+                    )
+                self.events.put(("warm_scrcpy_process", (target, process, None)))
+            except OSError as error:
+                self.events.put(("warm_scrcpy_process", (target, None, error)))
+
+        self._thread(launch_in_worker)
+        return
+        try:
+            process = subprocess.Popen(
+                [str(executable), "--serial", serial, "--window-title", f"iggents pronto {serial}",
+                 "--window-borderless", "--window-x", "-32000", "--window-y", "-32000", "--no-audio",
+                 "--max-size=540", "--max-fps=20", "--video-bit-rate=2M", "--render-driver=opengl"],
+                cwd=str(executable.parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                # Mover a janela para fora da tela já impede qualquer flash.
+                # Não a inicie com SW_HIDE: em alguns Windows/SDL ela deixa de
+                # ser enumerável como SDL_app e a reserva fica viva, porém
+                # impossível de encaixar na prévia.
+                startupinfo=None,
+            )
+            self.warm_scrcpy_processes[serial] = process
+        except OSError:
+            self.warm_scrcpy_starting_serials.discard(serial)
+            self.warm_scrcpy_starting = bool(self.warm_scrcpy_starting_serials)
+            self._retry_warm_live_view(serial)
+            if self.warm_scrcpy_queue:
+                self.after(80, self._start_next_warm_live_view)
+            return
+
+        # Process launch and SDL discovery are separate state transitions.  A
+        # slow or missing SDL for one device must never hold the queue hostage
+        # and prevent a later serial from receiving its own process.
+        def release_launch_slot(candidate=process, current_serial=serial) -> None:
+            if self.warm_scrcpy_processes.get(current_serial) is candidate:
+                self.warm_scrcpy_starting_serials.discard(current_serial)
+            self.warm_scrcpy_starting = bool(self.warm_scrcpy_starting_serials)
+            self._start_next_warm_live_view()
+
+        self.after(500, release_launch_slot)
+
+        def finish(candidate=process, attempt=0):
+            if candidate.poll() is not None:
+                try:
+                    _stdout, stderr = candidate.communicate(timeout=0)
+                    detail = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr or "")
+                    (RUNTIME_DIR / f"scrcpy_start_{serial}.log").write_text(detail, encoding="utf-8")
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                if self.warm_scrcpy_processes.get(serial) is candidate:
+                    self.warm_scrcpy_processes.pop(serial, None)
+                    self.warm_scrcpy_windows.pop(serial, None)
+                self.warm_scrcpy_starting_serials.discard(serial)
+                self.warm_scrcpy_starting = bool(self.warm_scrcpy_starting_serials)
+                self._retry_warm_live_view(serial)
+                if self.warm_scrcpy_queue:
+                    self.after(120, self._start_next_warm_live_view)
+                return
+            # A reserva nasce com SW_HIDE para nunca aparecer na barra de
+            # tarefas; portanto também precisa ser encontrada ainda oculta.
+            hwnd = self._window_for_process(candidate.pid, include_hidden=True)
+            # Alguns aparelhos terminam a instalação do servidor antes de
+            # criar a primeira janela SDL. Não encerre uma reserva saudável
+            # cedo demais: isso era justamente o que fazia o celular já
+            # selecionado só aparecer depois, ao abrir a grade.
+            if not hwnd and attempt < 180:
+                self.after(160, lambda: finish(candidate, attempt + 1)); return
+            if hwnd:
+                self.warm_scrcpy_windows[serial] = hwnd
+                self.warm_scrcpy_retry_attempts.pop(serial, None)
+                try:
+                    user32 = ctypes.windll.user32
+                    # A reserva continua sendo uma janela do Iggents: não
+                    # recebe botão próprio na barra de tarefas e não rouba
+                    # foco enquanto fica fora da área de prévia.
+                    user32.SetWindowLongPtrW(wintypes.HWND(hwnd), -8, wintypes.HWND(self.winfo_id()))
+                    style = int(user32.GetWindowLongPtrW(wintypes.HWND(hwnd), -20))
+                    user32.SetWindowLongPtrW(wintypes.HWND(hwnd), -20, style | 0x80 | 0x08000000)
+                    user32.SetWindowPos(wintypes.HWND(hwnd), 0, -32000, -32000, 2, 2, 0x0010 | 0x0040)
+                except (AttributeError, OSError):
+                    pass
+                # Na abertura, todos os celulares terminam primeiro a própria
+                # reserva. O selecionado não recebe um caminho especial nem
+                # tenta encaixar cedo: a barreira final o chamará pelo mesmo
+                # caminho usado por qualquer clique posterior na lista.
+                if (not self.device_visual_pool_loading
+                        and getattr(self, "app_view_var", None)
+                        and self.app_view_var.get() == "fluxo"):
+                    selected = self.selected_profiles()
+                    if (len(selected) == 1 and selected[0].get("state") == "device"
+                            and str(selected[0].get("serial", "")) == serial):
+                        self.after(0, lambda target=serial:
+                                   self._start_live_view_when_preview_ready(target))
+            else:
+                # Não encerre uma sessão viva só porque o Windows ainda não a
+                # enumerou como SDL_app. Em alguns aparelhos a janela aparece
+                # mais tarde; matar o processo aqui era a origem do celular
+                # que "sumia" da prévia e só voltava ao abrir Celulares.
+                # Mantemos a reserva e deixamos a sondagem normal encontrá-la
+                # quando for solicitada, sem criar uma cópia do mesmo serial.
+                self._recover_warm_live_view(serial, candidate)
+                return
+            self.warm_scrcpy_starting_serials.discard(serial)
+            self.warm_scrcpy_starting = bool(self.warm_scrcpy_starting_serials)
+            if self.warm_scrcpy_queue:
+                self.after(0, self._start_next_warm_live_view)
+        self.after(160, finish)
+
+    def _release_warm_launch_slot(self, serial: str) -> None:
+        self.warm_scrcpy_starting_serials.discard(serial)
+        self.warm_scrcpy_starting = bool(self.warm_scrcpy_starting_serials)
+        self._start_next_warm_live_view()
+
+    def _warm_scrcpy_process_started(self, serial: str, process: subprocess.Popen | None, error: OSError | None) -> None:
+        """Accept a worker-created process and wait for its PID-owned SDL."""
+        if error is not None or process is None:
+            self._trace_scrcpy_recovery(serial, f"falhou ao criar: {error}")
+            self._release_warm_launch_slot(serial)
+            self._retry_warm_live_view(serial)
+            return
+        current = self.warm_scrcpy_processes.get(serial)
+        if current is not None and current.poll() is None:
+            self._trace_scrcpy_recovery(serial, f"novo PID {process.pid} encerrado; reserva {current.pid} já existe")
+            self._release_warm_launch_slot(serial)
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            return
+        self.warm_scrcpy_processes[serial] = process
+        self._trace_scrcpy_recovery(serial, f"PID {process.pid} aceito")
+        # Só libera o próximo celular quando esta instância realmente criou a
+        # sua janela SDL. Abrir duas inicializações de vídeo ao mesmo tempo
+        # fazia a segunda (com frequência a previamente selecionada) cair antes
+        # de formar a textura.
+
+        def watch(attempt: int = 0) -> None:
+            if self.warm_scrcpy_processes.get(serial) is not process:
+                return
+            if process.poll() is not None:
+                self._trace_scrcpy_recovery(serial, f"PID {process.pid} encerrou, código {process.returncode}")
+                self.warm_scrcpy_processes.pop(serial, None)
+                self.warm_scrcpy_windows.pop(serial, None)
+                self._release_warm_launch_slot(serial)
+                self._retry_warm_live_view(serial)
+                return
+            hwnd = self._window_for_process(process.pid, include_hidden=True)
+            if not hwnd:
+                if attempt < 180:
+                    self.after(160, lambda: watch(attempt + 1))
+                else:
+                    self._release_warm_launch_slot(serial)
+                    self._recover_warm_live_view(serial, process)
+                return
+            self.warm_scrcpy_windows[serial] = hwnd
+            self.warm_scrcpy_retry_attempts.pop(serial, None)
+            self._trace_scrcpy_recovery(serial, f"PID {process.pid} pronto")
+            self._release_warm_launch_slot(serial)
+            try:
+                user32 = ctypes.windll.user32
+                user32.SetWindowLongPtrW(wintypes.HWND(hwnd), -8, wintypes.HWND(self.winfo_id()))
+                style = int(user32.GetWindowLongPtrW(wintypes.HWND(hwnd), -20))
+                user32.SetWindowLongPtrW(wintypes.HWND(hwnd), -20, style | 0x80 | 0x08000000)
+                user32.SetWindowPos(wintypes.HWND(hwnd), 0, -32000, -32000, 2, 2, 0x0010 | 0x0040)
+            except (AttributeError, OSError):
+                pass
+            # Uma reconexão pode levar mais tempo que a primeira tentativa da
+            # grade. Assim que a janela SDL finalmente existe, entregue a mesma
+            # reserva diretamente ao cartão atual; antes ela só era encaixada
+            # ao abrir a prévia do Fluxo ou trocar de aba.
+            if (getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares"
+                    and serial in self.device_grid_hosts):
+                self.grid_scrcpy_processes[serial] = process
+                session = self.grid_view_session
+                self.after(0, lambda target=serial, pid=process.pid, token=session:
+                           self._place_grid_live_view(target, pid, token))
+
+        self.after(160, watch)
+
+    def _recover_warm_live_view(self, serial: str, process: subprocess.Popen) -> None:
+        """Discard and restart only a reservation whose PID never got SDL."""
+        if self.warm_scrcpy_processes.get(serial) is not process:
+            return
+        self.warm_scrcpy_processes.pop(serial, None)
+        self.warm_scrcpy_windows.pop(serial, None)
+        try:
+            if process.poll() is None:
+                process.terminate()
+        except OSError:
+            pass
+        self._retry_warm_live_view(serial)
+
+    def _stop_warm_live_views(self) -> None:
+        processes = list(self.warm_scrcpy_processes.values())
+        self.warm_scrcpy_processes.clear()
+        self.warm_scrcpy_windows.clear(); self.warm_scrcpy_queue.clear(); self.warm_scrcpy_starting = False
+        self.warm_scrcpy_starting_serials.clear()
+        self.warm_scrcpy_retry_attempts.clear()
+        self.warm_scrcpy_retry_pending.clear()
+        for process in processes:
+            if process is self.scrcpy_process or process.poll() is not None:
+                continue
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    def start_live_view(self, preferred_serial: str | None = None, coordinate_edit: bool = False,
+                        reservation_attempt: int = 0) -> None:
         """Abre o scrcpy encaixado dentro da área fixa da prévia."""
         profiles = self.selected_profiles()
         serial = str(preferred_serial or "")
@@ -6144,6 +7881,21 @@ class MacroApp(tk.Tk):
         if not serial:
             messagebox.showwarning("Visualização ao vivo", "Selecione um único telefone conectado.", parent=self)
             return
+        # Chamadas atrasadas são normais enquanto uma reserva cria a janela
+        # SDL. Elas só podem encaixar a tela que continua selecionada no
+        # Fluxo. Sem essa trava, uma tentativa antiga voltava depois de a
+        # pessoa trocar de telefone — e podia parar/ocultar a prévia nova ou
+        # até iniciar a tela antiga ao entrar em Celulares.
+        if not coordinate_edit and getattr(self, "app_view_var", None):
+            if self.app_view_var.get() != "fluxo":
+                return
+            selected_serial = (
+                str(profiles[0].get("serial", ""))
+                if len(profiles) == 1 and profiles[0].get("state") == "device"
+                else ""
+            )
+            if selected_serial and selected_serial != serial:
+                return
         executable = APP_DIR / "tools" / "scrcpy" / "scrcpy-win64-v4.1" / "scrcpy.exe"
         if not executable.exists():
             messagebox.showerror("Visualização ao vivo", "O scrcpy não foi encontrado na pasta tools.", parent=self)
@@ -6154,8 +7906,24 @@ class MacroApp(tk.Tk):
         # aqui causava piscadas, atraso e a janela aparecendo no centro.
         current_process = self.scrcpy_process
         if (self.live_view_mode and str(self.scrcpy_serial) == serial
-                and current_process is not None and current_process.poll() is None):
+                and current_process is not None and current_process.poll() is None
+                and self._scrcpy_process_matches_serial(current_process, serial)):
             self.live_view_edit_mode = bool(coordinate_edit)
+            # O canvas é reconstruído ao abrir o programa e ao trocar de
+            # painel. A sessão do telefone já selecionado pode existir, mas
+            # sua janela ainda estar fora da tela. Reencontre-a pelo PID e
+            # encaixe-a novamente em vez de apenas tentar redimensionar uma
+            # posição que pertencia ao canvas anterior.
+            hwnd = int(self.scrcpy_window_handle or 0)
+            if not self._window_belongs_to_process(hwnd, current_process.pid):
+                hwnd = self._window_for_process(current_process.pid, include_hidden=True)
+            if hwnd:
+                self.scrcpy_window_handle = hwnd
+                if self.live_view_uses_warm_pool:
+                    self.warm_scrcpy_processes[serial] = current_process
+                    self.warm_scrcpy_windows[serial] = hwnd
+                session = self.live_view_session
+                self.after(0, lambda token=session: self._embed_live_view(0, token))
             self._resize_embedded_live_view(force=True)
             self._update_live_touch_marker()
             return
@@ -6164,21 +7932,92 @@ class MacroApp(tk.Tk):
         try:
             self.live_view_session += 1
             session = self.live_view_session
+            warmed = self.warm_scrcpy_processes.get(serial)
+            if warmed and not self._scrcpy_process_matches_serial(warmed, serial):
+                # Nunca transforme um processo de outro telefone em reserva do
+                # selecionado. Remover só a associação errada preserva o
+                # processo verdadeiro no serial ao qual ele pertence.
+                if self.warm_scrcpy_processes.get(serial) is warmed:
+                    self.warm_scrcpy_processes.pop(serial, None)
+                    self.warm_scrcpy_windows.pop(serial, None)
+                warmed = None
+            warm_hwnd = int(self.warm_scrcpy_windows.get(serial, 0) or 0)
+            if warmed and warm_hwnd and not self._window_belongs_to_process(warm_hwnd, warmed.pid):
+                self.warm_scrcpy_windows.pop(serial, None)
+                warm_hwnd = 0
+            if warmed and warmed.poll() is None:
+                warm_hwnd = warm_hwnd or self._window_for_process(warmed.pid, include_hidden=True)
+                if not warm_hwnd:
+                    # A reserva já existe; aguarde-a terminar de criar SDL em
+                    # vez de iniciar um segundo scrcpy ao trocar a seleção.
+                    if reservation_attempt < 240:
+                        self.after(100, lambda target=serial, count=reservation_attempt + 1:
+                                   self.start_live_view(target, reservation_attempt=count))
+                    else:
+                        # A reserva continua viva. Não a encerre por um tempo
+                        # limite da prévia: isso fazia justamente o celular
+                        # inicial variar a cada abertura, pois a sua tentativa
+                        # atrasada matava o único scrcpy daquele serial.
+                        self.after(250, lambda target=serial:
+                                   self.start_live_view(target, reservation_attempt=0))
+                    return
+                else:
+                    self.warm_scrcpy_windows[serial] = warm_hwnd
+                    self.scrcpy_process = warmed
+                    self.scrcpy_window_handle = warm_hwnd
+                    self.scrcpy_serial = serial
+                    self.live_view_mode = True
+                    self.live_view_edit_mode = bool(coordinate_edit)
+                    self.live_view_uses_warm_pool = True
+                    self.scrcpy_window_title = f"iggents pronto {serial}"
+                    self.preview_session += 1
+                    # Usa o mesmo encaixe completo da prévia recém-aberta. Isso
+                    # reaplica dono, camada e tamanho antes de exibir a reserva.
+                    self.after(0, lambda token=session: self._embed_live_view(0, token))
+                    self.after(80, lambda: self._resize_embedded_live_view(force=True))
+                    self.status.set(f"Visualização pronta para {serial}.")
+                    return
+            if (serial in self.warm_scrcpy_queue
+                    or serial in self.warm_scrcpy_starting_serials
+                    or serial in self.warm_scrcpy_retry_pending):
+                # O serial já está reservado para a pré-carga, só ainda não
+                # recebeu PID. Selecioná-lo não pode criar uma cópia.
+                if reservation_attempt < 240:
+                    self.after(100, lambda target=serial, count=reservation_attempt + 1:
+                                   self.start_live_view(target, reservation_attempt=count))
+                return
+            # The preview never has a private creation path.  Request the
+            # same per-serial reservation used by startup and the grid, then
+            # wait for its PID-owned SDL window (also in coordinate mode).
+            self._queue_warm_live_view(serial)
+            self.after(100, lambda target=serial, count=reservation_attempt + 1:
+                       self.start_live_view(target, coordinate_edit=coordinate_edit,
+                                            reservation_attempt=count))
+            return
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.live_view_uses_warm_pool = False
             self.scrcpy_window_title = f"iggents — {serial}"
             self.scrcpy_serial = serial
             # O scrcpy cria a janela antes de o Tk ter chance de encaixá-la.
             # Ela nasce fora da área visível e só aparece depois de o canvas
             # de prévia estar pronto, evitando o salto para o centro da tela.
             command = [str(executable), "--serial", serial, "--window-title", self.scrcpy_window_title,
-                       "--window-borderless", "--window-x", "-32000", "--window-y", "-32000", "--no-audio"]
+                       "--window-borderless", "--window-x", "-32000", "--window-y", "-32000", "--no-audio",
+                       "--max-size=540", "--max-fps=20", "--video-bit-rate=2M", "--render-driver=opengl"]
             if coordinate_edit:
                 command.append("--no-control")
             self.scrcpy_process = subprocess.Popen(
                 command,
                 cwd=str(executable.parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=flags,
+                startupinfo=self._hidden_scrcpy_startupinfo(),
             )
+            if not coordinate_edit:
+                # A primeira prévia também passa a ser a reserva deste
+                # celular, para a troca posterior ao painel Celulares não
+                # iniciar outra conexão.
+                self.warm_scrcpy_processes[serial] = self.scrcpy_process
+                self.live_view_uses_warm_pool = True
             self.live_view_mode = True
             self.live_view_edit_mode = coordinate_edit
             # A janela do scrcpy preserva a proporção do telefone e pode deixar
@@ -6227,9 +8066,27 @@ class MacroApp(tk.Tk):
                 self.after(80, lambda: self._start_live_view_when_preview_ready(serial, attempt + 1))
             return
         process = self.scrcpy_process
+        keep_warm = bool(self.live_view_uses_warm_pool)
         if (self.live_view_mode and self.scrcpy_serial == serial
-                and process is not None and process.poll() is None):
+                and process is not None and process.poll() is None
+                and self._scrcpy_process_matches_serial(process, serial)):
+            # Na abertura inicial o telefone restaurado pode já ter o processo
+            # vivo, porém o canvas acabou de ser recriado. Reencaixá-lo aqui é
+            # essencial: só redimensionar preservava a posição fora da tela.
+            hwnd = int(self.scrcpy_window_handle or 0)
+            if not self._window_belongs_to_process(hwnd, process.pid):
+                hwnd = self._window_for_process(process.pid, include_hidden=True)
+            if hwnd:
+                self.scrcpy_window_handle = hwnd
+                if self.live_view_uses_warm_pool:
+                    self.warm_scrcpy_processes[serial] = process
+                    self.warm_scrcpy_windows[serial] = hwnd
+                session = self.live_view_session
+                self.after(0, lambda token=session: self._embed_live_view(0, token))
             self._resize_embedded_live_view(force=True)
+            # Trocar apenas o painel não exige criar outro scrcpy. Atualiza a
+            # máscara imediatamente sobre o vídeo que já está em tempo real.
+            self._update_live_touch_marker()
             return
         self.start_live_view(serial)
 
@@ -6237,9 +8094,17 @@ class MacroApp(tk.Tk):
         self.live_view_session += 1
         process = self.scrcpy_process
         window_handle = int(self.scrcpy_window_handle or 0)
-        # Ao sair da prévia, a janela do scrcpy nunca pode sobreviver sobre a
-        # grade de celulares. Esconde primeiro; em seguida encerra o processo.
-        if window_handle:
+        keep_warm = bool(self.live_view_uses_warm_pool)
+        # Uma janela reservada continua pertencendo ao Iggents, apenas sai da
+        # área visível da prévia. As demais são encerradas normalmente.
+        if window_handle and keep_warm:
+            try:
+                ctypes.windll.user32.SetWindowPos(
+                    wintypes.HWND(window_handle), 0, -32000, -32000, 2, 2, 0x0010 | 0x0040
+                )
+            except (AttributeError, OSError):
+                pass
+        elif window_handle:
             try:
                 ctypes.windll.user32.ShowWindow(window_handle, 0)
             except (AttributeError, OSError):
@@ -6257,16 +8122,25 @@ class MacroApp(tk.Tk):
         self.scrcpy_window_bounds = None
         self.scrcpy_client_bounds = None
         self.scrcpy_serial = ""
+        self.live_view_uses_warm_pool = False
+        if keep_warm:
+            self.status.set("Visualização ao vivo devolvida à pré-carga.")
+            return
         if process is None or process.poll() is not None:
             self.status.set("Nenhuma visualização ao vivo estava ativa.")
             return
         try:
             process.terminate()
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
+            pass
+        # Não aguarde o SDL encerrar aqui: trocar de celular ou abrir a grade
+        # precisa devolver o controle à interface imediatamente.
+        try:
             subprocess.Popen(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError:
+            pass
         self.status.set("Visualização ao vivo encerrada.")
 
     def _embed_live_view(self, attempt: int = 0, session: int | None = None) -> None:
@@ -6283,12 +8157,17 @@ class MacroApp(tk.Tk):
             return
         try:
             user32 = ctypes.windll.user32
-            hwnd = self._window_for_process(process.pid)
+            # A prévia recém-criada ainda está oculta até receber sua posição
+            # no canvas. Procurar só janelas visíveis a deixava presa para
+            # sempre em “Iniciando visualização”.
+            hwnd = self._window_for_process(process.pid, include_hidden=True)
             if not hwnd:
                 if attempt < 35:
                     self.after(80, lambda: self._embed_live_view(attempt + 1, session))
                 return
             self.scrcpy_window_handle = hwnd
+            if self.live_view_uses_warm_pool:
+                self.warm_scrcpy_windows[self.scrcpy_serial] = hwnd
             # É uma janela pertencente ao iggents, não uma janela independente:
             # por isso não ganha ícone próprio na barra de tarefas, mas continua
             # sendo SDL/top-level e não perde o vídeo como ocorria com SetParent.
@@ -6311,7 +8190,7 @@ class MacroApp(tk.Tk):
                 self.after(80, lambda: self._embed_live_view(attempt + 1, session))
 
     @staticmethod
-    def _window_for_process(process_id: int) -> int:
+    def _window_for_process(process_id: int, include_hidden: bool = False) -> int:
         """Encontra a janela principal do scrcpy pelo PID, não pelo título.
 
         Com ``--window-borderless`` alguns SDL/Windows não expõem o título
@@ -6326,7 +8205,13 @@ class MacroApp(tk.Tk):
             def visit(hwnd, _lparam):
                 owner_pid = ctypes.c_ulong()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
-                if owner_pid.value == process_id and user32.IsWindowVisible(hwnd):
+                # O scrcpy pode criar janelas auxiliares do IME no mesmo PID.
+                # Apenas a SDL_app contém o vídeo; a IME aparecia primeiro e
+                # era encaixada no cartão em vez da tela do telefone.
+                class_name = ctypes.create_unicode_buffer(128)
+                user32.GetClassNameW(wintypes.HWND(hwnd), class_name, len(class_name))
+                if (owner_pid.value == process_id and class_name.value == "SDL_app"
+                        and (include_hidden or user32.IsWindowVisible(hwnd))):
                     found.value = hwnd
                     return False
                 return True
@@ -6335,6 +8220,41 @@ class MacroApp(tk.Tk):
             return int(found.value or 0)
         except (AttributeError, OSError):
             return 0
+
+    @staticmethod
+    def _window_belongs_to_process(hwnd: int, process_id: int) -> bool:
+        """Confirma o PID de um HWND antes de reutilizá-lo em um cartão."""
+        try:
+            owner_pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(
+                wintypes.HWND(hwnd), ctypes.byref(owner_pid)
+            )
+            return int(owner_pid.value) == int(process_id)
+        except (AttributeError, OSError):
+            return False
+
+    @staticmethod
+    def _scrcpy_process_matches_serial(process: subprocess.Popen | None, serial: str) -> bool:
+        """Confirma o serial real passado ao scrcpy antes de reaproveitá-lo.
+
+        ``scrcpy_serial`` representa a prévia solicitada e pode ficar defasado
+        durante uma troca rápida. O comando do processo, por outro lado, é a
+        identidade imutável da sessão. Sem esta confirmação uma reserva de um
+        celular podia ser registrada sob o serial do selecionado e deixá-lo sem
+        processo próprio.
+        """
+        if process is None or not serial:
+            return False
+        try:
+            args = process.args
+            values = list(args) if isinstance(args, (list, tuple)) else str(args).split()
+            expected = str(serial)
+            if f"--serial={expected}" in values:
+                return True
+            index = values.index("--serial")
+            return index + 1 < len(values) and str(values[index + 1]) == expected
+        except (AttributeError, ValueError, TypeError):
+            return False
 
     def _check_live_view_started(self, session: int | None = None) -> None:
         if session is not None and session != self.live_view_session:
@@ -6387,6 +8307,10 @@ class MacroApp(tk.Tk):
             self.after(0, self._sync_live_view_client_bounds)
             self.after(90, self._sync_live_view_client_bounds)
             self._update_live_touch_marker()
+            # SetWindowPos do SDL Ã© assÃ­ncrono em alguns aparelhos. Esta
+            # confirmaÃ§Ã£o curta mantÃ©m a camada da etapa acima do vÃ­deo ao
+            # terminar a troca de celular ou o redimensionamento da prÃ©via.
+            self.after(55, self._update_live_touch_marker)
         except (AttributeError, OSError, tk.TclError):
             self.scrcpy_window_handle = 0
 
@@ -6430,6 +8354,17 @@ class MacroApp(tk.Tk):
             return None
         action = actions[index]
         return action if action.kind in ("tap", "swipe") else None
+
+    def _flow_live_view_is_current_editor(self) -> bool:
+        """Confirma que Ctrl/Alt pertencem Ã  lista ativa do Fluxo."""
+        if not getattr(self, "app_view_var", None) or self.app_view_var.get() != "fluxo":
+            return False
+        selected = self.selected_profiles()
+        return bool(
+            len(selected) == 1
+            and selected[0].get("state") == "device"
+            and str(selected[0].get("serial", "")) == str(self.scrcpy_serial)
+        )
 
     def _live_content_bounds(self, bounds: tuple[int, int, int, int] | None = None,
                              screen: tuple[int, int] | None = None) -> tuple[int, int, int, int, int, int] | None:
@@ -6638,8 +8573,16 @@ class MacroApp(tk.Tk):
                     for x, y, color in ((*start, "#36d399"), (*end, "#ff5a78")):
                         canvas.create_oval(x - 9, y - 9, x + 9, y + 9, fill=color, outline="#121722", width=2)
             self.live_marker_window.geometry(f"{width}x{height}+{left}+{top}")
-            self.live_marker_window.deiconify(); self.live_marker_window.lift()
-        except (TypeError, ValueError, tk.TclError):
+            self.live_marker_window.deiconify()
+            # ``lift`` sozinho sÃ³ reorganiza janelas Tk. O scrcpy Ã© uma
+            # janela SDL/top-level, portanto reafirmamos a mÃ¡scara como
+            # topmost sem ativÃ¡-la nem tomar o foco do editor.
+            ctypes.windll.user32.SetWindowPos(
+                wintypes.HWND(self.live_marker_window.winfo_id()), wintypes.HWND(-1),
+                left, top, width, height, 0x0010 | 0x0040,
+            )
+            self.live_marker_window.lift()
+        except (AttributeError, OSError, TypeError, ValueError, tk.TclError):
             self._hide_live_touch_marker()
 
     def show_live_xml_element(self, attrs: dict[str, str], source_size: tuple[int, int] | None = None) -> None:
@@ -6793,12 +8736,13 @@ class MacroApp(tk.Tk):
             picker = self.live_xml_picker
             picker_active = bool(picker and self.live_view_mode
                                  and str(picker.get("serial", "")) == str(self.scrcpy_serial))
+            flow_editor = self._flow_live_view_is_current_editor()
             # Durante a escolha de XML, o clique não pode alcançar o telefone:
             # ele serve exclusivamente para escolher o nó sob o cursor.
-            modifier_blocking = (alt_down or ctrl_down or picker_active) and self.live_view_mode
+            modifier_blocking = (alt_down or ctrl_down or picker_active) and self.live_view_mode and (flow_editor or picker_active)
             self._set_scrcpy_alt_passthrough(modifier_blocking)
             self._set_live_marker_mouse_intercept(modifier_blocking)
-            can_edit = self.live_view_mode and (self.live_view_edit_mode or alt_down)
+            can_edit = flow_editor and self.live_view_mode and (self.live_view_edit_mode or alt_down)
             if self._live_ctrl_record_start is not None and not down:
                 point = wintypes.POINT()
                 ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
@@ -6806,8 +8750,10 @@ class MacroApp(tk.Tk):
                 start = self._live_ctrl_record_start
                 self._live_ctrl_record_start = None
                 self._live_ctrl_record_mouse_down = False
-                if end is not None:
+                if end is not None and flow_editor:
                     self._append_live_preview_gesture(start, end)
+                elif end is not None:
+                    self.status.set("Gravação cancelada: a lista ativa do Fluxo mudou durante o gesto.")
             if down and not self._live_edit_mouse_down and self.scrcpy_window_bounds:
                 point = wintypes.POINT()
                 ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
@@ -6819,7 +8765,7 @@ class MacroApp(tk.Tk):
                 inside_live_view = left <= point.x < left + width and top <= point.y < top + height
                 if picker_active and inside_live_view:
                     self._finish_live_xml_picker(point)
-                elif ctrl_down and not alt_down and inside_live_view:
+                elif flow_editor and ctrl_down and not alt_down and inside_live_view:
                     start = self._live_view_point_to_macro(point, self.scrcpy_window_bounds)
                     if start is not None:
                         began = time.monotonic()
@@ -7354,6 +9300,12 @@ class MacroApp(tk.Tk):
         serial = self._execution_state_serial()
         state = self.device_execution_states.get(serial, {})
         running = state.get("running")
+        state_panel = str(state.get("panel", "") or "")
+        # Um telefone pode executar o painel atribuído enquanto a pessoa edita
+        # outro. IDs como ``a:0:1`` existem nos dois fluxos, mas representam
+        # etapas diferentes; nesse caso não destaque uma linha enganosa.
+        if state_panel and state_panel != self.flow_var.get():
+            running = None
         def walk(parent: str = ""):
             for tree_item in self.tree.get_children(parent):
                 yield tree_item
@@ -7498,7 +9450,8 @@ class MacroApp(tk.Tk):
         except tk.TclError:
             pass
 
-    def set_running_item(self, item: str | None, serial: str | None = None) -> None:
+    def set_running_item(self, item: str | None, serial: str | None = None,
+                         panel: str | None = None) -> None:
         """Registra a linha atual separadamente para cada telefone."""
         # Cada etapa troca o destaque visual. A marcação XML é válida somente
         # para a etapa que a encontrou, portanto não pode permanecer sobre a
@@ -7514,9 +9467,15 @@ class MacroApp(tk.Tk):
             state = self.device_execution_states.setdefault(serial, {"running": None})
             previous_item = state.get("running")
             if previous_item and previous_item != item:
-                self._collapse_finished_grid_containers(serial, str(previous_item))
-                self._collapse_finished_main_containers(str(previous_item))
+                grid_tree = self.device_grid_flow_trees.get(serial)
+                grid_panel = str(getattr(grid_tree, "grid_panel", "") or "") if grid_tree else ""
+                if not grid_panel or not panel or grid_panel == panel:
+                    self._collapse_finished_grid_containers(serial, str(previous_item))
+                if not panel or panel == self.flow_var.get():
+                    self._collapse_finished_main_containers(str(previous_item))
             state["running"] = item
+            if panel:
+                state["panel"] = str(panel)
             self._refresh_device_grid_title(serial)
         # Na grade, redesenhar a árvore principal oculta a cada evento de cada
         # aparelho consome o ciclo do Tk e faz os cartões parecerem travados.
@@ -7526,7 +9485,9 @@ class MacroApp(tk.Tk):
         if not in_grid:
             self._render_execution_state()
         if serial:
-            self._render_grid_running_step(serial, item)
+            tree = self.device_grid_flow_trees.get(serial)
+            tree_panel = str(getattr(tree, "grid_panel", "") or "") if tree else ""
+            self._render_grid_running_step(serial, item if not tree_panel or not panel or tree_panel == panel else None)
         # A máscara é atualizada no mesmo evento que troca o destaque da
         # árvore; não há captura extra de tela nem custo perceptível.
         if in_grid and serial:
@@ -7562,9 +9523,9 @@ class MacroApp(tk.Tk):
             # N\u00e3o agrupa telefones diferentes em uma \u00fanica linha. Cada estado
             # pendente \u00e9 aplicado no mesmo ciclo visual, preservando o destaque
             # de todos os celulares que executam em paralelo.
-            for serial, item in pending.items():
+            for serial, (item, panel) in pending.items():
                 try:
-                    self.set_running_item(item, serial or None)
+                    self.set_running_item(item, serial or None, panel)
                 except (tk.TclError, KeyError, ValueError):
                     continue
         except Exception:
@@ -7629,6 +9590,9 @@ class MacroApp(tk.Tk):
         info = tk.StringVar(value="Atualizando XML do telefone…")
         captured: list[dict[str, str]] = []
         visible: list[dict[str, str]] = []
+        refreshing = False
+        capture_serial = str(self.adb.serial)
+        capture_source = ""
 
         ttk.Label(dialog, text="Pesquisar no XML atual:").grid(row=0, column=0, padx=18, pady=(16, 6), sticky="w")
         ctk.CTkEntry(dialog, textvariable=query, width=600, height=32, corner_radius=8,
@@ -7648,18 +9612,58 @@ class MacroApp(tk.Tk):
                 visible.append(attrs)
                 shown = attrs.get("text") or attrs.get("content-desc") or attrs.get("resource-id") or attrs.get("class", "elemento")
                 elements.insert(tk.END, f"{shown}   [{attrs.get('class', '')}]")
-            info.set(f"{len(visible)} elemento(s). Clique em um para localizá-lo na prévia.")
+            source_text = (f" XML capturado via {xml_capture_source_label(capture_source)}."
+                           if capture_source else "")
+            info.set(f"{len(visible)} elemento(s). Clique em um para localizá-lo na prévia.{source_text}")
 
         def refresh() -> None:
-            try:
-                captured.clear()
-                for node in ET.fromstring(self.adb.ui_xml()).iter("node"):
-                    attrs = dict(node.attrib)
-                    if self._xml_searchable(attrs):
-                        captured.append(attrs)
-                render()
-            except Exception as error:
-                info.set(f"Não foi possível ler o XML: {error}")
+            nonlocal refreshing
+            if refreshing:
+                return
+            refreshing = True
+            info.set("Lendo XML do telefone…")
+            refresh_button.configure(state="disabled")
+
+            def capture() -> None:
+                nonlocal capture_source
+                values: list[dict[str, str]] = []
+                truncated = False
+                error_text = ""
+                try:
+                    # Uma tela específica do A14s pode demorar a responder;
+                    # nunca bloqueie o ciclo visual do Tk durante a captura.
+                    adb = Adb()
+                    adb.path, adb.serial = self.adb.path, capture_serial
+                    xml = adb.capture_ui_xml(retries=4)
+                    capture_source = adb.last_xml_capture_source
+                    for node in ET.fromstring(xml).iter("node"):
+                        attrs = dict(node.attrib)
+                        if not self._xml_searchable(attrs):
+                            continue
+                        values.append(attrs)
+                        if len(values) >= 10_000:
+                            truncated = True
+                            break
+                except Exception as error:
+                    error_text = str(error)
+
+                def finish() -> None:
+                    nonlocal refreshing
+                    if not dialog.winfo_exists():
+                        return
+                    refreshing = False
+                    refresh_button.configure(state="normal")
+                    if error_text:
+                        info.set(f"Não foi possível ler o XML: {error_text}")
+                        return
+                    captured[:] = values
+                    render()
+                    if truncated:
+                        info.set(f"{len(visible)} elemento(s) exibido(s), limitado a 10.000 para manter o programa estável.")
+
+                self.after(0, finish)
+
+            self._thread(capture)
 
         def choose(_event=None) -> None:
             if not elements.curselection() or not visible:
@@ -7672,8 +9676,9 @@ class MacroApp(tk.Tk):
 
         query.trace_add("write", render)
         elements.bind("<<ListboxSelect>>", choose)
-        ctk.CTkButton(dialog, text="Atualizar XML", command=refresh, width=135, height=32, corner_radius=8,
-                      fg_color="#39455b", hover_color="#4a5870").grid(row=4, column=0, padx=18, pady=(4, 16), sticky="w")
+        refresh_button = ctk.CTkButton(dialog, text="Atualizar XML", command=refresh, width=135, height=32, corner_radius=8,
+                                       fg_color="#39455b", hover_color="#4a5870")
+        refresh_button.grid(row=4, column=0, padx=18, pady=(4, 16), sticky="w")
         refresh()
 
     def show_nav_rc_debug_xml(self) -> None:
@@ -8305,6 +10310,65 @@ class MacroApp(tk.Tk):
         search.focus_set()
         self._prepare_popup_window(dialog)
 
+    def manage_identities(self) -> None:
+        """Edita as listas soltas de nomes, sobrenomes e links das identidades."""
+        try:
+            names = [str(profile["nome"]) for profile in load_name_profiles()]
+            surnames = load_last_names()
+            links = load_identity_links()
+        except (RuntimeError, ValueError) as error:
+            messagebox.showerror("Gerenciar identidades", str(error), parent=self)
+            return
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Gerenciar identidades")
+        dialog.geometry("950x560")
+        dialog.transient(self); dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Identidades aleatórias", font=("Segoe UI Semibold", 19)).pack(anchor="w", padx=18, pady=(18, 3))
+        ctk.CTkLabel(dialog, text="Nomes e sobrenomes são combinados ao criar uma identidade. Links são uma lista geral, sem vínculo com nome, sobrenome, pasta ou celular.", text_color="#aebbd0", wraplength=900).pack(anchor="w", padx=18, pady=(0, 12))
+        columns = ctk.CTkFrame(dialog, fg_color="transparent")
+        columns.pack(fill="both", expand=True, padx=18, pady=(0, 12))
+        columns.grid_columnconfigure((0, 1, 2), weight=1)
+        editors: dict[str, ctk.CTkTextbox] = {}
+        descriptions = {
+            "names": ("Nomes", "Um por linha."),
+            "surnames": ("Sobrenomes", "Um por linha. Não permite a mesma sequência inicial de 3 letras."),
+            "links": ("Links gerais", "Um por linha. Cada uso sorteia um link desta lista."),
+        }
+        for column, (key, (title, description)) in enumerate(descriptions.items()):
+            frame = ctk.CTkFrame(columns, fg_color="#171b26", corner_radius=8)
+            frame.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 6, 0 if column == 2 else 6))
+            ctk.CTkLabel(frame, text=title, font=("Segoe UI Semibold", 15)).pack(anchor="w", padx=12, pady=(12, 2))
+            ctk.CTkLabel(frame, text=description, text_color="#aebbd0", wraplength=270, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+            editor = ctk.CTkTextbox(frame, fg_color="#202737", text_color="#e7edf7")
+            editor.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+            editors[key] = editor
+        editors["names"].insert("1.0", "\n".join(names))
+        editors["surnames"].insert("1.0", "\n".join(surnames))
+        editors["links"].insert("1.0", "\n".join(links))
+
+        def entries(key: str) -> list[str]:
+            return [line.strip() for line in editors[key].get("1.0", "end").splitlines() if line.strip()]
+
+        def save() -> None:
+            try:
+                name_values = entries("names")
+                if not name_values:
+                    raise ValueError("Mantenha ao menos um nome.")
+                save_name_profiles([{"nome": name} for name in name_values])
+                save_last_names(entries("surnames"))
+                save_identity_links(entries("links"))
+            except (RuntimeError, ValueError) as error:
+                messagebox.showwarning("Gerenciar identidades", str(error), parent=dialog)
+                return
+            self.status.set("Nomes, sobrenomes e links gerais das identidades salvos.")
+            dialog.destroy()
+
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.pack(fill="x", padx=18, pady=(0, 18))
+        ctk.CTkButton(actions, text="Cancelar", command=dialog.destroy, width=100, height=32, fg_color="#39455b", hover_color="#4a5870").pack(side="left")
+        ctk.CTkButton(actions, text="Salvar identidades", command=save, width=155, height=32, fg_color="#2f6fed", hover_color="#4b82ee").pack(side="right")
+        self._prepare_popup_window(dialog)
+
     def manage_random_users(self) -> None:
         """Edita os arquivos e o link vinculados a cada nome aleatório."""
         try:
@@ -8547,30 +10611,131 @@ class MacroApp(tk.Tk):
         refresh()
         self._prepare_popup_window(dialog)
 
+    def manage_identity_media_root(self) -> None:
+        """Configura a raiz que contém identidade1, identidade2, etc."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Pasta de identidades")
+        dialog.geometry("670x260")
+        dialog.transient(self); dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Pasta de identidades", font=("Segoe UI Semibold", 18)).pack(anchor="w", padx=18, pady=(18, 4))
+        ctk.CTkLabel(dialog, text="Escolha a pasta que contém as identidades. Cada identidade deve conter perfil e verificacao; story é uma única pasta compartilhada na raiz.", text_color="#aebbd0", wraplength=620).pack(anchor="w", padx=18)
+        path_var = tk.StringVar(value=str(self.settings.get("identity_media_root", "") or IDENTITIES_DIR))
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(16, 8))
+        ctk.CTkEntry(row, textvariable=path_var, height=32).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row, text="Escolher", width=98, height=32, command=lambda: path_var.set(filedialog.askdirectory(parent=dialog) or path_var.get())).pack(side="left", padx=(8, 0))
+        preview = tk.StringVar(value="")
+        ctk.CTkLabel(dialog, textvariable=preview, text_color="#aebbd0").pack(anchor="w", padx=18)
+
+        def inspect(*_args) -> None:
+            try:
+                folders = identity_media_folders(path_var.get().strip())
+                preview.set(f"{len(folders)} identidade(s) encontrada(s): " + ", ".join(folder.name for folder in folders[:5]))
+            except RuntimeError as error:
+                preview.set(str(error))
+
+        def save() -> None:
+            try:
+                identity_media_folders(path_var.get().strip())
+            except RuntimeError as error:
+                messagebox.showwarning("Pasta de identidades", str(error), parent=dialog)
+                return
+            self.settings["identity_media_root"] = path_var.get().strip()
+            self._save_settings()
+            self.status.set("Pasta de identidades salva.")
+            dialog.destroy()
+
+        path_var.trace_add("write", inspect); inspect()
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(fill="x", padx=18, pady=(14, 18))
+        ctk.CTkButton(buttons, text="Cancelar", command=dialog.destroy, width=100, height=32, fg_color="#39455b", hover_color="#4a5870").pack(side="left")
+        ctk.CTkButton(buttons, text="Salvar pasta", command=save, width=120, height=32, fg_color="#2f6fed", hover_color="#4b82ee").pack(side="right")
+
+    def _assign_identity_media_folder(self, runtime_variables: RuntimeVariables) -> Path:
+        root = str(self.settings.get("identity_media_root", "") or IDENTITIES_DIR).strip()
+        folder = random_identity_media_folder(root)
+        runtime_variables.set("IDENTITY_MEDIA_FOLDER", str(folder))
+        runtime_variables.set("IDENTITY_MEDIA_NAME", folder.name)
+        return folder
+
+    def _random_media_from_identity(self, runtime_variables: RuntimeVariables, media_type: str) -> tuple[Path, str]:
+        if media_type == "story":
+            root = str(self.settings.get("identity_media_root", "") or IDENTITIES_DIR).strip()
+            return random_fixed_identity_media(root, "story"), "story"
+        folder_value = str(runtime_variables.get("IDENTITY_MEDIA_FOLDER", "")).strip()
+        if not folder_value:
+            raise RuntimeError("Esta identidade ainda não possui uma pasta de mídias temporária. Execute antes a etapa Nova identidade.")
+        source = random_identity_media(folder_value, media_type)
+        return source, Path(folder_value).name
+
+    def _wait_before_xml_tap(self, action: Action, stop_event: threading.Event) -> bool:
+        """Espera global aleatória depois de localizar qualquer XML tocável."""
+        try:
+            lower = max(0, int(self.settings.get("xml_global_tap_wait_min_ms", 0)))
+            upper = max(lower, int(self.settings.get("xml_global_tap_wait_max_ms", 0)))
+        except (TypeError, ValueError):
+            lower = upper = 0
+        return stop_event.wait(random.randint(lower, upper) / 1000) if upper else False
+
+    def configure_global_xml_tap_wait(self) -> None:
+        """Configura uma única espera usada por todos os toques XML."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Espera global dos XMLs")
+        dialog.geometry("520x255"); dialog.resizable(False, False)
+        dialog.transient(self); dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Espera global antes de tocar XML", font=("Segoe UI Semibold", 17)).pack(anchor="w", padx=20, pady=(20, 4))
+        ctk.CTkLabel(dialog, text="Depois que qualquer XML for encontrado, o programa sorteia uma espera neste intervalo antes do toque. Vale para todos os fluxos e etapas XML.",
+                     text_color="#aebbd0", wraplength=475, justify="left").pack(anchor="w", padx=20)
+        values = ctk.CTkFrame(dialog, fg_color="transparent"); values.pack(fill="x", padx=20, pady=(18, 8))
+        minimum = tk.StringVar(value=str(self.settings.get("xml_global_tap_wait_min_ms", 0)))
+        maximum = tk.StringVar(value=str(self.settings.get("xml_global_tap_wait_max_ms", 0)))
+        ctk.CTkLabel(values, text="Mínimo (ms):").pack(side="left")
+        ctk.CTkEntry(values, textvariable=minimum, width=85).pack(side="left", padx=(8, 18))
+        ctk.CTkLabel(values, text="Máximo (ms):").pack(side="left")
+        ctk.CTkEntry(values, textvariable=maximum, width=85).pack(side="left", padx=(8, 0))
+
+        def save() -> None:
+            try:
+                lower, upper = int(minimum.get().strip()), int(maximum.get().strip())
+                if lower < 0 or upper < lower:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Espera global dos XMLs", "Use milissegundos não negativos, com máximo maior ou igual ao mínimo.", parent=dialog)
+                return
+            self.settings["xml_global_tap_wait_min_ms"] = lower
+            self.settings["xml_global_tap_wait_max_ms"] = upper
+            self._save_settings()
+            self.status.set(f"Espera global XML: {lower}–{upper} ms.")
+            dialog.destroy()
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent"); buttons.pack(fill="x", padx=20, pady=(8, 18))
+        ctk.CTkButton(buttons, text="Cancelar", command=dialog.destroy, width=100, fg_color="#39445a").pack(side="right", padx=(8, 0))
+        ctk.CTkButton(buttons, text="Salvar", command=save, width=100).pack(side="right")
+
     def add_random_user_files_action(self) -> None:
-        characters = load_random_characters()
-        folders = self._character_media_folders(characters)
-        if not folders:
-            messagebox.showwarning("Enviar mídia", "Cadastre personagens com uma pasta existente em Gerenciar personagens antes de criar esta etapa.", parent=self)
+        try:
+            identity_media_folders(str(self.settings.get("identity_media_root", "") or IDENTITIES_DIR).strip())
+        except RuntimeError:
+            messagebox.showwarning("Mídia da identidade", "Configure primeiro a Pasta de identidades.", parent=self)
             return
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Escolher pasta de mídia do personagem")
+        dialog.title("Mídia da identidade")
         dialog.geometry("520x250")
         dialog.transient(self); dialog.grab_set()
-        ctk.CTkLabel(dialog, text="Escolha a pasta de mídia", font=("Segoe UI Semibold", 16)).pack(anchor="w", padx=18, pady=(18, 4))
-        ctk.CTkLabel(dialog, text="A identidade usa seu personagem vinculado; no momento de enviar, uma mídia aleatória desta pasta será processada e enviada.",
+        ctk.CTkLabel(dialog, text="Escolha a mídia da identidade", font=("Segoe UI Semibold", 16)).pack(anchor="w", padx=18, pady=(18, 4))
+        ctk.CTkLabel(dialog, text="Perfil e verificação usam a identidade temporária. Story usa a pasta única identidades/story.",
                      text_color="#aebbd0", wraplength=470).pack(anchor="w", padx=18)
-        selected_folder_label = tk.StringVar(value=next(iter(folders)))
-        picker = ctk.CTkOptionMenu(dialog, variable=selected_folder_label, values=list(folders), width=330,
+        labels = {"perfil": "Perfil", "story": "Story", "verificacao": "Verificação"}
+        selected_label = tk.StringVar(value=labels["perfil"])
+        picker = ctk.CTkOptionMenu(dialog, variable=selected_label, values=[labels[key] for key in (*IDENTITY_MEDIA_TYPES, *FIXED_IDENTITY_MEDIA_TYPES)], width=330,
                                    fg_color="#39455b", button_color="#4a5870", button_hover_color="#5a6884")
         picker.pack(anchor="w", padx=18, pady=(14, 8))
 
         def add() -> None:
-            folder = folders[selected_folder_label.get()]
-            folder_name = folder or "raiz do personagem"
+            media_type = next(key for key, label in labels.items() if label == selected_label.get())
             self._append_special_action(
-                Action("random_user_files", delay_ms=400, character_media_folder=folder, label=f"Enviar mídia: {folder_name}"),
-                f"Etapa adicionada para sortear uma mídia da pasta {folder_name} do personagem."
+                Action("random_user_files", delay_ms=400, identity_media_type=media_type, label=f"Enviar {labels[media_type]} da identidade"),
+                f"Etapa adicionada para sortear e enviar uma mídia de {labels[media_type].casefold()} da identidade."
             )
             dialog.destroy()
         actions = ctk.CTkFrame(dialog, fg_color="transparent")
@@ -8723,9 +10888,525 @@ class MacroApp(tk.Tk):
 
     def add_random_user_link_action(self) -> None:
         self._append_special_action(
-            Action("random_user_link", delay_ms=400, label="Digitar link do nome"),
-            "Etapa para digitar o link do usuário sorteado adicionada."
+            Action("random_user_link", delay_ms=400, label="Digitar link aleatório"),
+            "Etapa para sortear e digitar um link da lista geral de identidades adicionada."
         )
+
+    def add_browser_invite_action(self) -> None:
+        self._append_special_action(
+            Action("browser_invite", delay_ms=400, label="Enviar convite"),
+            "Etapa adicionada: abre o navegador isolado e convida o @ atual como Testador do Instagram."
+        )
+
+    @staticmethod
+    def _default_browser_invite_actions() -> list[dict]:
+        return [
+            {"type": "click", "selector": "adicionar_pessoas"},
+            {"type": "click", "selector": "testador_instagram"},
+            {"type": "current_username", "selector": "usuario_instagram"},
+            {"type": "wait", "ms": 7000},
+            {"type": "key", "selector": "usuario_instagram", "key": "Enter"},
+            {"type": "click", "selector": "confirmar_adicionar"},
+        ]
+
+    def configure_browser_invite_action(self, action: Action, tree_item: str | None = None) -> None:
+        """Editor visual da sequência de ações do navegador de convite."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Configurar Enviar convite")
+        dialog.geometry("790x650"); dialog.minsize(690, 540)
+        dialog.transient(self); dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Enviar convite — navegador", font=("Segoe UI Semibold", 18)).pack(anchor="w", padx=18, pady=(18, 3))
+        ctk.CTkLabel(dialog, text="Configure a ordem: clique, digite o @ atual, escreva texto, espere ou pressione uma tecla. "
+                     "Os nomes de seletor vêm de ‘Capturar seletores do convite’.", text_color="#aebbd0", wraplength=740,
+                     justify="left").pack(anchor="w", padx=18, pady=(0, 12))
+        url_var = tk.StringVar(value=action.browser_url or INVITE_URL)
+        url_row = ctk.CTkFrame(dialog, fg_color="transparent"); url_row.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkLabel(url_row, text="Link:", width=45).pack(side="left")
+        ctk.CTkEntry(url_row, textvariable=url_var).pack(side="left", fill="x", expand=True)
+
+        steps = copy.deepcopy(action.browser_actions) if action.browser_actions is not None else self._default_browser_invite_actions()
+        captures: dict = {}
+        try:
+            loaded = json.loads(INVITE_SELECTOR_CAPTURES_FILE.read_text(encoding="utf-8"))
+            captures = loaded if isinstance(loaded, dict) else {}
+        except (OSError, ValueError):
+            pass
+        selector_values = ["(página)"] + list(captures) + [name for name in INVITE_SELECTORS if name not in captures]
+
+        main = ctk.CTkFrame(dialog, fg_color="transparent"); main.pack(fill="both", expand=True, padx=18)
+        rows = tk.Listbox(main, height=12, bg="#202737", fg="#e7edf7", selectbackground="#4d71ad", activestyle="none", borderwidth=0)
+        rows.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(main, orient="vertical", command=rows.yview); scrollbar.pack(side="left", fill="y")
+        rows.configure(yscrollcommand=scrollbar.set)
+        editor = ctk.CTkFrame(main, width=245); editor.pack(side="left", fill="y", padx=(12, 0)); editor.pack_propagate(False)
+        kind_var = tk.StringVar(value="Clique")
+        selector_var = tk.StringVar(value=selector_values[0])
+        value_var = tk.StringVar(value="")
+        ctk.CTkLabel(editor, text="Ação").pack(anchor="w", padx=12, pady=(14, 2))
+        kind_menu = ctk.CTkOptionMenu(editor, values=["Clique", "Digitar @ atual", "Digitar texto", "Apertar tecla", "Esperar"], variable=kind_var)
+        kind_menu.pack(fill="x", padx=12)
+        ctk.CTkLabel(editor, text="Seletor").pack(anchor="w", padx=12, pady=(11, 2))
+        selector_menu = ctk.CTkOptionMenu(editor, values=selector_values, variable=selector_var)
+        selector_menu.pack(fill="x", padx=12)
+        value_label = ctk.CTkLabel(editor, text="Texto / tecla / ms")
+        value_label.pack(anchor="w", padx=12, pady=(11, 2))
+        value_entry = ctk.CTkEntry(editor, textvariable=value_var, placeholder_text="Ex.: Enter ou 7000")
+        value_entry.pack(fill="x", padx=12)
+        ctk.CTkLabel(editor, text="Teclas aceitas: Enter, Tab, Escape, ArrowDown, Control+A etc.", text_color="#aebbd0", wraplength=215,
+                     justify="left").pack(anchor="w", padx=12, pady=(8, 0))
+
+        def describe(step: dict) -> str:
+            kind = step.get("type")
+            if kind == "click": return f"Clique  →  {step.get('selector', '')}"
+            if kind == "current_username": return f"Digitar @ atual  →  {step.get('selector', '')}"
+            if kind == "text": return f"Digitar texto  →  {step.get('selector', '')}: {step.get('text', '')}"
+            if kind == "key": return f"Tecla {step.get('key', '')}  →  {step.get('selector', 'página')}"
+            if kind == "wait": return f"Esperar  →  {step.get('ms', 0)} ms"
+            return str(step)
+
+        def redraw(select_index: int | None = None) -> None:
+            rows.delete(0, "end")
+            for step in steps: rows.insert("end", describe(step))
+            if select_index is not None and 0 <= select_index < len(steps): rows.selection_set(select_index); rows.activate(select_index)
+
+        def selected_index() -> int | None:
+            selected = rows.curselection()
+            return int(selected[0]) if selected else None
+
+        def step_from_form() -> dict | None:
+            label = kind_var.get()
+            selector = selector_var.get().strip()
+            if selector == "(página)":
+                selector = ""
+            value = value_var.get().strip()
+            if label == "Clique":
+                if not selector: return None
+                return {"type": "click", "selector": selector}
+            if label == "Digitar @ atual":
+                if not selector: return None
+                return {"type": "current_username", "selector": selector}
+            if label == "Digitar texto":
+                if not selector: return None
+                return {"type": "text", "selector": selector, "text": value}
+            if label == "Apertar tecla":
+                if not value: return None
+                return {"type": "key", "selector": selector, "key": value}
+            try:
+                milliseconds = int(value)
+                if milliseconds < 0: raise ValueError
+            except ValueError:
+                return None
+            return {"type": "wait", "ms": milliseconds}
+
+        def choose(_event=None) -> None:
+            index = selected_index()
+            if index is None: return
+            step = steps[index]; mapping = {"click":"Clique", "current_username":"Digitar @ atual", "text":"Digitar texto", "key":"Apertar tecla", "wait":"Esperar"}
+            kind_var.set(mapping.get(step.get("type"), "Clique")); selector_var.set(step.get("selector") or "(página)")
+            value_var.set(str(step.get("text", step.get("key", step.get("ms", "")))))
+
+        def add_or_update(update: bool = False) -> None:
+            step = step_from_form()
+            if step is None:
+                messagebox.showwarning("Enviar convite", "Preencha o seletor e, para tecla/espera, informe o valor.", parent=dialog); return
+            index = selected_index() if update else None
+            if index is None:
+                steps.append(step); redraw(len(steps) - 1)
+            else:
+                steps[index] = step; redraw(index)
+
+        def move(delta: int) -> None:
+            index = selected_index()
+            if index is None or not 0 <= index + delta < len(steps): return
+            steps[index], steps[index + delta] = steps[index + delta], steps[index]; redraw(index + delta)
+
+        def remove() -> None:
+            index = selected_index()
+            if index is None: return
+            steps.pop(index); redraw(min(index, len(steps) - 1))
+
+        rows.bind("<<ListboxSelect>>", choose)
+        buttons = ctk.CTkFrame(editor, fg_color="transparent"); buttons.pack(fill="x", padx=12, pady=(12, 0))
+        ctk.CTkButton(buttons, text="Adicionar", command=add_or_update, width=104).grid(row=0, column=0, padx=(0, 5), pady=3)
+        ctk.CTkButton(buttons, text="Atualizar", command=lambda: add_or_update(True), width=104, fg_color="#39445a").grid(row=0, column=1, pady=3)
+        ctk.CTkButton(buttons, text="▲ Subir", command=lambda: move(-1), width=104, fg_color="#39445a").grid(row=1, column=0, padx=(0, 5), pady=3)
+        ctk.CTkButton(buttons, text="▼ Descer", command=lambda: move(1), width=104, fg_color="#39445a").grid(row=1, column=1, pady=3)
+        ctk.CTkButton(editor, text="Remover", command=remove, fg_color="#7a3440").pack(fill="x", padx=12, pady=3)
+
+        def save() -> None:
+            url = url_var.get().strip()
+            if not url.startswith(("http://", "https://")):
+                messagebox.showwarning("Enviar convite", "Informe um link http(s) válido.", parent=dialog); return
+            # A edição do painel à direita representa a linha selecionada.
+            # Salvar deve aplicá-la mesmo que a pessoa não tenha clicado antes
+            # em “Atualizar” (especialmente ao apenas trocar o seletor).
+            current_index = selected_index()
+            if current_index is not None:
+                pending = step_from_form()
+                if pending is None:
+                    messagebox.showwarning("Enviar convite", "A ação selecionada está incompleta. Preencha os campos ou remova a linha.", parent=dialog)
+                    return
+                steps[current_index] = pending
+            self.push_undo(); action.browser_url = url; action.browser_actions = steps
+            self.refresh_tree(); self.save_macro(quiet=True)
+            if tree_item and self.tree.exists(tree_item): self.tree.selection_set(tree_item); self.tree.focus(tree_item); self.tree.see(tree_item)
+            self.status.set("Etapa Enviar convite configurada."); dialog.destroy()
+
+        footer = ctk.CTkFrame(dialog, fg_color="transparent"); footer.pack(fill="x", padx=18, pady=14)
+        ctk.CTkButton(footer, text="Cancelar", command=dialog.destroy, width=100, fg_color="#39445a").pack(side="right", padx=(8, 0))
+        ctk.CTkButton(footer, text="Salvar", command=save, width=100).pack(side="right")
+        redraw()
+
+    def manage_invite_selectors(self) -> None:
+        """Interface visual para capturar e guardar seletores da aba Meta."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Seletores do convite")
+        dialog.geometry("820x590")
+        dialog.minsize(690, 470)
+        dialog.transient(self)
+        ctk.CTkLabel(dialog, text="Capturar seletores do convite", font=("Segoe UI Semibold", 18)).pack(
+            anchor="w", padx=18, pady=(18, 3)
+        )
+        ctk.CTkLabel(
+            dialog,
+            text="Com a aba do Meta aberta, dê um nome e clique em Capturar. Em seguida clique no elemento no Chrome. "
+                 "Esse único clique será bloqueado e apenas usado para identificar o seletor.",
+            text_color="#aebbd0", wraplength=760, justify="left"
+        ).pack(anchor="w", padx=18, pady=(0, 14))
+
+        header = ctk.CTkFrame(dialog, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(0, 10))
+        selector_name = tk.StringVar(value="testador_instagram")
+        ctk.CTkEntry(header, textvariable=selector_name, placeholder_text="Nome, ex.: testador_instagram").pack(
+            side="left", fill="x", expand=True, padx=(0, 8)
+        )
+        status = tk.StringVar(value="Pronto para capturar.")
+
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18)
+        tree = ttk.Treeview(body, columns=("nome", "seletor"), show="headings", height=12)
+        tree.heading("nome", text="Nome")
+        tree.heading("seletor", text="Seletor recomendado")
+        tree.column("nome", width=190, anchor="w", stretch=False)
+        tree.column("seletor", width=560, anchor="w")
+        tree.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=tree.yview)
+        scroll.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scroll.set)
+
+        details = ctk.CTkTextbox(dialog, height=120, fg_color="#202737", text_color="#e7edf7")
+        details.pack(fill="x", padx=18, pady=(10, 8))
+
+        def load_captures() -> dict:
+            try:
+                content = json.loads(INVITE_SELECTOR_CAPTURES_FILE.read_text(encoding="utf-8"))
+                return content if isinstance(content, dict) else {}
+            except (OSError, ValueError):
+                return {}
+
+        def refresh(selected_name: str | None = None) -> None:
+            tree.delete(*tree.get_children())
+            captures = load_captures()
+            for name, info in captures.items():
+                options = info.get("selectors", []) if isinstance(info, dict) else []
+                recommended = next((item.get("value", "") for item in options if item.get("kind") != "CSS estrutural (último recurso)"), "")
+                item = tree.insert("", "end", iid=name, values=(name, recommended))
+                if name == selected_name:
+                    tree.selection_set(item); tree.focus(item)
+            show_selected()
+
+        def show_selected(_event=None) -> None:
+            selected = tree.selection()
+            details.delete("1.0", "end")
+            if not selected:
+                return
+            info = load_captures().get(selected[0], {})
+            lines = [f"Elemento: <{info.get('tag', '?')}>   Texto: {info.get('text', '')}", "", "Opções capturadas:"]
+            lines.extend(f"• {item.get('kind', 'seletor')}: {item.get('value', '')}" for item in info.get("selectors", []))
+            details.insert("1.0", "\n".join(lines))
+
+        def save_capture(name: str, capture: dict) -> None:
+            captures = load_captures()
+            captures[name] = {"capturado_em": datetime.now().isoformat(timespec="seconds"), **capture}
+            INVITE_SELECTOR_CAPTURES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            INVITE_SELECTOR_CAPTURES_FILE.write_text(json.dumps(captures, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        def capture_in_browser() -> None:
+            name = selector_name.get().strip()
+            if not name:
+                messagebox.showwarning("Seletores do convite", "Dê um nome para este seletor.", parent=dialog)
+                return
+            if sync_playwright is None:
+                messagebox.showerror("Seletores do convite", "Playwright não está instalado.", parent=dialog)
+                return
+            status.set("Aguarde: preparando a captura na aba do Chrome...")
+            capture_button.configure(state="disabled")
+
+            def worker() -> None:
+                try:
+                    with sync_playwright() as playwright:
+                        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{INVITE_BROWSER_PORT}")
+                        context = browser.contexts[0]
+                        page = next((item for item in context.pages if "developers.facebook.com/apps/1730475298100839/roles/roles" in item.url), None)
+                        if page is None:
+                            raise RuntimeError("A aba do convite Meta não está aberta no navegador isolado.")
+                        # Traz a aba certa à frente antes de armar a captura:
+                        # assim fica evidente onde o próximo clique deve ser feito.
+                        page.bring_to_front()
+                        page.evaluate("""
+                            () => {
+                              document.getElementById('__iggents_selector_capture__')?.remove();
+                              window.__iggentsSelectorCapture = null;
+                              const banner = document.createElement('div');
+                              banner.id = '__iggents_selector_capture__';
+                              banner.textContent = 'IGGENTS: clique no elemento que deseja capturar';
+                              Object.assign(banner.style, {position:'fixed',top:'10px',left:'50%',transform:'translateX(-50%)',zIndex:'2147483647',padding:'10px 16px',borderRadius:'8px',color:'#fff',background:'#d35400',font:'600 14px Arial',pointerEvents:'none'});
+                              document.documentElement.appendChild(banner);
+                              const escape = value => String(value).replace(/"/g, '\\\\"');
+                              const capture = event => {
+                                if (event.target === banner) return;
+                                event.preventDefault(); event.stopImmediatePropagation();
+                                const target = event.target.closest('input, button, [role="button"], [role="gridcell"], [role="option"], a, [contenteditable="true"]') || event.target;
+                                const text = (target.innerText || target.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ');
+                                const options = [];
+                                const add = (kind, value) => value && !options.some(item => item.value === value) && options.push({kind, value});
+                                if (target.getAttribute('aria-label')) add('aria-label', `[aria-label="${escape(target.getAttribute('aria-label'))}"]`);
+                                if (target.getAttribute('placeholder')) add('placeholder', `${target.tagName.toLowerCase()}[placeholder="${escape(target.getAttribute('placeholder'))}"]`);
+                                if (target.getAttribute('role') && text) add('role + texto', `[role="${target.getAttribute('role')}"]:has-text("${escape(text)}")`);
+                                if (target.getAttribute('name')) add('name', `${target.tagName.toLowerCase()}[name="${escape(target.getAttribute('name'))}"]`);
+                                if (target.getAttribute('type')) add('tipo', `${target.tagName.toLowerCase()}[type="${escape(target.getAttribute('type'))}"]`);
+                                window.__iggentsSelectorCapture = {tag:target.tagName.toLowerCase(), role:target.getAttribute('role'), text, outer_html:target.outerHTML.slice(0,4000), selectors:options};
+                                banner.textContent = 'IGGENTS: seletor capturado. Volte ao programa.';
+                                document.removeEventListener('click', capture, true);
+                              };
+                              document.addEventListener('click', capture, true);
+                            }
+                        """)
+                        self.after(0, lambda: status.set("Captura ativa: clique agora no elemento desejado no Chrome."))
+                        deadline = time.monotonic() + 90
+                        result = None
+                        while time.monotonic() < deadline:
+                            result = page.evaluate("window.__iggentsSelectorCapture")
+                            if result:
+                                break
+                            time.sleep(0.15)
+                        if not result:
+                            raise RuntimeError("Nenhum elemento foi clicado em 90 segundos.")
+                    self.after(0, lambda: (save_capture(name, result), refresh(name), status.set(f"‘{name}’ capturado e organizado.")))
+                except Exception as error:
+                    self.after(0, lambda: messagebox.showerror("Seletores do convite", str(error), parent=dialog))
+                finally:
+                    self.after(0, lambda: capture_button.configure(state="normal"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def delete_selected() -> None:
+            selected = tree.selection()
+            if not selected:
+                return
+            name = selected[0]
+            if not messagebox.askyesno("Seletores do convite", f"Remover ‘{name}’?", parent=dialog):
+                return
+            captures = load_captures(); captures.pop(name, None)
+            INVITE_SELECTOR_CAPTURES_FILE.write_text(json.dumps(captures, ensure_ascii=False, indent=2), encoding="utf-8")
+            refresh(); status.set(f"‘{name}’ removido.")
+
+        def test_selected_click() -> None:
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("Seletores do convite", "Selecione um seletor capturado para testar.", parent=dialog)
+                return
+            name = selected[0]
+            info = load_captures().get(name, {})
+            options = info.get("selectors", []) if isinstance(info, dict) else []
+            selector = next((item.get("value") for item in options if item.get("value") and item.get("kind") != "CSS estrutural (último recurso)"), None)
+            if not selector:
+                messagebox.showwarning("Seletores do convite", "Esse item não possui um seletor utilizável para testar.", parent=dialog)
+                return
+            status.set(f"Testando clique em ‘{name}’...")
+            test_button.configure(state="disabled")
+
+            def worker() -> None:
+                try:
+                    with sync_playwright() as playwright:
+                        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{INVITE_BROWSER_PORT}")
+                        context = browser.contexts[0]
+                        page = next((item for item in context.pages if "developers.facebook.com/apps/1730475298100839/roles/roles" in item.url), None)
+                        if page is None:
+                            raise RuntimeError("A aba do convite Meta não está aberta no navegador isolado.")
+                        page.bring_to_front()
+                        captured_text = str(info.get("text", "")).strip()
+                        if "Testador do Instagram" in captured_text:
+                            radios = page.locator('input[type="radio"]')
+                            index = radios.evaluate_all("nodes => nodes.findIndex(node => { const label = document.getElementById(node.getAttribute('aria-labelledby') || ''); return label && label.textContent.trim() === 'Testador do Instagram'; })")
+                            if index < 0:
+                                raise RuntimeError("O rádio Testador do Instagram não está visível. Abra primeiro ‘Adicionar pessoas’.")
+                            target, count = radios.nth(index), 1
+                            target.check(force=True, timeout=30000)
+                        else:
+                            # O botão final tem o mesmo texto parcial de
+                            # “Adicionar pessoas”; excluí-lo evita clicar no
+                            # botão errado quando o seletor capturado é Enviar.
+                            target = (page.locator('[role="button"]:visible').filter(has_text="Adicionar").filter(has_not_text="Adicionar pessoas").first
+                                      if captured_text == "Adicionar" else page.locator(selector).first)
+                            count = (page.locator('[role="button"]:visible').filter(has_text="Adicionar").filter(has_not_text="Adicionar pessoas").count()
+                                     if captured_text == "Adicionar" else page.locator(selector).count())
+                            if count < 1:
+                                raise RuntimeError("O seletor não encontrou nenhum elemento nesta tela.")
+                            try:
+                                target.click(timeout=30000)
+                            except Exception:
+                                target.click(timeout=30000, force=True)
+                    self.after(0, lambda: status.set(f"Clique realizado em ‘{name}’ ({count} encontrado(s))."))
+                except Exception as error:
+                    self.after(0, lambda: messagebox.showerror("Teste de seletor", f"‘{name}’ não clicou:\n{error}", parent=dialog))
+                finally:
+                    self.after(0, lambda: test_button.configure(state="normal"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tree.bind("<<TreeviewSelect>>", show_selected)
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill="x", padx=18, pady=(0, 14))
+        capture_button = ctk.CTkButton(footer, text="Capturar na aba aberta", command=capture_in_browser)
+        capture_button.pack(side="left")
+        test_button = ctk.CTkButton(footer, text="Testar clique selecionado", command=test_selected_click, fg_color="#2f6fed")
+        test_button.pack(side="left", padx=(8, 0))
+        ctk.CTkButton(footer, text="Atualizar lista", command=refresh, fg_color="#39445a").pack(side="left", padx=8)
+        ctk.CTkButton(footer, text="Remover selecionado", command=delete_selected, fg_color="#7a3440").pack(side="left")
+        ctk.CTkLabel(footer, textvariable=status, text_color="#aebbd0").pack(side="right")
+        refresh()
+
+    @staticmethod
+    def _invite_browser_ready() -> bool:
+        try:
+            with urlopen(f"http://127.0.0.1:{INVITE_BROWSER_PORT}/json/version", timeout=1):
+                return True
+        except (OSError, urllib.error.URLError):
+            return False
+
+    def _send_browser_invite(self, username: str, browser_actions: list[dict] | None = None,
+                             browser_url: str | None = None) -> None:
+        if sync_playwright is None:
+            raise RuntimeError("Playwright não está instalado. Execute: py -m pip install playwright")
+        username = str(username or "").strip().lstrip("@")
+        if not username:
+            raise RuntimeError("Não há um @ atual para convidar. Execute antes a etapa de gerar usuário.")
+        INVITE_BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+        if not self._invite_browser_ready():
+            chrome = (shutil.which("chrome") or shutil.which("chrome.exe")
+                      or str(Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe"))
+            if not Path(chrome).is_file():
+                raise RuntimeError("Google Chrome não foi encontrado para abrir o perfil de convite.")
+            subprocess.Popen([chrome, f"--user-data-dir={INVITE_BROWSER_PROFILE}",
+                              f"--remote-debugging-port={INVITE_BROWSER_PORT}", "--no-first-run", browser_url or INVITE_URL],
+                             creationflags=NO_CONSOLE)
+            deadline = time.monotonic() + 25
+            while time.monotonic() < deadline and not self._invite_browser_ready():
+                time.sleep(0.25)
+            if not self._invite_browser_ready():
+                raise RuntimeError("O navegador de convite não respondeu. Faça login nele e tente novamente.")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{INVITE_BROWSER_PORT}")
+            context = browser.contexts[0]
+            # Reaproveita a aba já aberta do app; só cria uma se ela não existir.
+            page = next((item for item in context.pages
+                         if "developers.facebook.com/apps/1730475298100839/roles/roles" in item.url), None)
+            if page is None:
+                page = context.new_page()
+                # Só navega na primeira abertura. Nas execuções seguintes a
+                # aba é reaproveitada no estado em que ficou, sem recarregar
+                # nem fechar a janela “Adicionar pessoas”.
+                page.goto(browser_url or INVITE_URL, wait_until="domcontentloaded", timeout=60000)
+            try:
+                captures = json.loads(INVITE_SELECTOR_CAPTURES_FILE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                captures = {}
+
+            def locator_for(name: str):
+                captured = captures.get(name, {}) if isinstance(captures, dict) else {}
+                choices = captured.get("selectors", []) if isinstance(captured, dict) else []
+                captured_text = str(captured.get("text", "")).strip() if isinstance(captured, dict) else ""
+                if captured_text == "Adicionar":
+                    return page.locator('[role="button"]:visible').filter(has_text="Adicionar").filter(has_not_text="Adicionar pessoas").first
+                if captured_text == "Adicionar pessoas":
+                    return page.locator('[role="button"]:visible').filter(has_text="Adicionar pessoas").first
+                selector = next((item.get("value") for item in choices if item.get("value") and item.get("kind") != "CSS estrutural (último recurso)"), None)
+                if selector:
+                    return page.locator(selector).first
+                if name == "adicionar_pessoas":
+                    return page.locator(INVITE_SELECTORS[name]).filter(has_text="Adicionar pessoas").first
+                if name == "confirmar_adicionar":
+                    return page.locator(INVITE_SELECTORS[name]).filter(has_text="Adicionar").filter(has_not_text="Adicionar pessoas").first
+                return page.locator(INVITE_SELECTORS.get(name, name)).first
+
+            def retry_browser_action(description: str, operation) -> bool:
+                """Repete até funcionar; a interrupção manual ainda encerra a espera."""
+                attempts = 0
+                next_report_at = time.monotonic() + 10
+                while not self.run_stop_event.is_set():
+                    attempts += 1
+                    try:
+                        operation()
+                        return True
+                    except Exception:
+                        # A página de funções do Meta pode demorar para montar
+                        # seus componentes. Isto não deve abortar o fluxo.
+                        if time.monotonic() >= next_report_at:
+                            self.events.put(("status", f"Enviar convite: aguardando {description} (tentativa {attempts})."))
+                            next_report_at = time.monotonic() + 10
+                        page.wait_for_timeout(500)
+                return False
+
+            for step_index, step in enumerate(browser_actions if browser_actions is not None else self._default_browser_invite_actions(), start=1):
+                kind, selector_name = str(step.get("type", "")), str(step.get("selector", "")).strip()
+                if kind == "wait":
+                    page.wait_for_timeout(max(0, int(step.get("ms", 0))))
+                elif kind == "click":
+                    captured = captures.get(selector_name, {}) if isinstance(captures, dict) else {}
+                    captured_text = str(captured.get("text", "")) if isinstance(captured, dict) else ""
+                    if selector_name == "testador_instagram" or "Testador do Instagram" in captured_text:
+                        def select_instagram_tester() -> None:
+                            radios = page.locator('input[type="radio"]')
+                            index = radios.evaluate_all("nodes => nodes.findIndex(node => { const label = document.getElementById(node.getAttribute('aria-labelledby') || ''); return label && label.textContent.trim() === 'Testador do Instagram'; })")
+                            if index < 0:
+                                raise RuntimeError("Rádio ainda não carregou.")
+                            radios.nth(index).check(force=True, timeout=BROWSER_INVITE_CLICK_TIMEOUT_MS)
+                        completed = retry_browser_action("o Testador do Instagram", select_instagram_tester)
+                    else:
+                        completed = retry_browser_action(
+                            f"o clique ‘{selector_name or step_index}’",
+                            lambda: locator_for(selector_name).click(timeout=BROWSER_INVITE_CLICK_TIMEOUT_MS),
+                        )
+                    if not completed:
+                        return
+                elif kind == "current_username":
+                    if not retry_browser_action(f"o campo ‘{selector_name or step_index}’",
+                                                lambda: locator_for(selector_name).fill(username, timeout=BROWSER_INVITE_CLICK_TIMEOUT_MS)):
+                        return
+                elif kind == "text":
+                    if not retry_browser_action(f"o campo ‘{selector_name or step_index}’",
+                                                lambda: locator_for(selector_name).fill(str(step.get("text", "")), timeout=BROWSER_INVITE_CLICK_TIMEOUT_MS)):
+                        return
+                elif kind == "key":
+                    key = str(step.get("key", "")).strip()
+                    if not key:
+                        raise RuntimeError("A ação de tecla está sem uma tecla definida.")
+                    if not retry_browser_action(f"a tecla {key}", lambda: (locator_for(selector_name) if selector_name else page.locator("body")).press(key, timeout=BROWSER_INVITE_CLICK_TIMEOUT_MS)):
+                        return
+                    page.wait_for_timeout(350)
+                else:
+                    raise RuntimeError(f"Tipo de ação desconhecido: {kind}")
+
+    def _current_invite_username(self, runtime_variables: RuntimeVariables, serial: str | None) -> str:
+        """Obtém o @ já gerado ou o reserva para a identidade atual."""
+        username = str(runtime_variables.get("CURRENT_USERNAME", "")).strip().lstrip("@")
+        if username:
+            return username
+        identity = latest_identity_for_device(serial)
+        username = reserve_instagram_username(identity["nome"], identity["sobrenome"], serial)
+        runtime_variables.set("CURRENT_USERNAME", username)
+        return username
 
     def manage_link_titles(self) -> None:
         dialog = ctk.CTkToplevel(self)
@@ -10148,6 +12829,8 @@ class MacroApp(tk.Tk):
         selector_blocked_text = tk.StringVar(value=str(existing.selector_blocked_text or "") if existing else "")
         match_mode = tk.StringVar(value="Contém" if existing and existing.match_mode == "contains" else "Exato")
         timeout = tk.StringVar(value=str(existing.timeout_s) if existing else "10")
+        tap_wait_min = tk.StringVar(value=str(existing.xml_tap_wait_min_ms) if existing else "0")
+        tap_wait_max = tk.StringVar(value=str(existing.xml_tap_wait_max_ms) if existing else "0")
         unavailable_tap = tk.BooleanVar(value=bool(existing and existing.xml_unavailable_tap_x is not None and existing.xml_unavailable_tap_y is not None))
         unavailable_x = tk.StringVar(value=str(existing.xml_unavailable_tap_x) if existing and existing.xml_unavailable_tap_x is not None else "")
         unavailable_y = tk.StringVar(value=str(existing.xml_unavailable_tap_y) if existing and existing.xml_unavailable_tap_y is not None else "")
@@ -10167,16 +12850,22 @@ class MacroApp(tk.Tk):
         ctk.CTkEntry(dialog, textvariable=timeout, width=48, height=30, corner_radius=8,
                      fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=3, column=3, padx=4, pady=8, sticky="w")
         ttk.Label(dialog, text="segundos").grid(row=3, column=4, padx=(2, 12), pady=8, sticky="w")
+        ttk.Label(dialog, text="Espera antes do toque:").grid(row=4, column=0, padx=18, pady=(2, 5), sticky="w")
+        ctk.CTkButton(dialog, text="Configurar global para todos os XMLs", command=self.configure_global_xml_tap_wait,
+                      width=235, height=28, fg_color="#39455b", hover_color="#4a5870").grid(row=4, column=1, columnspan=3, padx=8, pady=(2, 5), sticky="w")
         ctk.CTkCheckBox(dialog, text="Se XML indisponível, tocar em:", variable=unavailable_tap,
-                        width=190, checkbox_width=17, checkbox_height=17).grid(row=4, column=0, padx=18, pady=(2, 5), sticky="w")
-        ctk.CTkEntry(dialog, textvariable=unavailable_x, width=72, height=28, placeholder_text="X").grid(row=4, column=1, padx=(8, 3), pady=(2, 5), sticky="w")
-        ctk.CTkEntry(dialog, textvariable=unavailable_y, width=72, height=28, placeholder_text="Y").grid(row=4, column=1, padx=(86, 3), pady=(2, 5), sticky="w")
+                        width=190, checkbox_width=17, checkbox_height=17).grid(row=5, column=0, padx=18, pady=(2, 5), sticky="w")
+        ctk.CTkEntry(dialog, textvariable=unavailable_x, width=72, height=28, placeholder_text="X").grid(row=5, column=1, padx=(8, 3), pady=(2, 5), sticky="w")
+        ctk.CTkEntry(dialog, textvariable=unavailable_y, width=72, height=28, placeholder_text="Y").grid(row=5, column=1, padx=(86, 3), pady=(2, 5), sticky="w")
         elements = tk.Listbox(dialog, height=11, width=78, bg="#202737", fg="#e7edf7", selectbackground="#2d5eb8",
                               highlightthickness=0, borderwidth=0, activestyle="none")
         elements.grid(row=5, column=0, columnspan=5, padx=18, pady=(12, 8), sticky="nsew")
         captured: list[dict[str, str]] = []
         filtered: list[dict[str, str]] = []
         exact_choice: dict[str, str] = {}
+        capture_busy = False
+        capture_serial = str(self.adb.serial)
+        capture_source = ""
         if existing and existing.selector_type == "exact_xml":
             try:
                 saved_choice = json.loads(existing.selector_value or "{}")
@@ -10202,23 +12891,57 @@ class MacroApp(tk.Tk):
                 filtered.append(attrs)
                 shown = attrs.get("text") or attrs.get("content-desc") or attrs.get("resource-id") or attrs.get("class", "elemento")
                 elements.insert(tk.END, f"{shown}   [{attrs.get('class', '')}]")
-            result_info.set(f"{len(filtered)} resultado(s) no XML capturado." if captured else "Capture o XML da tela e pesquise um item acima.")
+            result_info.set(
+                f"{len(filtered)} resultado(s) no XML capturado via {xml_capture_source_label(capture_source)}."
+                if captured else "Capture o XML da tela e pesquise um item acima."
+            )
 
         def capture():
-            try:
-                root = ET.fromstring(self.adb.ui_xml())
-                captured.clear()
-                for node in root.iter("node"):
-                    attrs = node.attrib
-                    if not self._xml_searchable(attrs):
-                        continue
-                    captured.append(dict(attrs))
-                    shown = attrs.get("text") or attrs.get("content-desc") or attrs.get("resource-id")
-                    elements.insert(tk.END, f"{shown}   [{attrs.get('class', '')}]")
-                if not captured: elements.insert(tk.END, "Nenhum elemento com texto/descrição/ID encontrado.")
-                render_results()
-            except Exception as error:
-                messagebox.showerror("XML", str(error), parent=dialog)
+            nonlocal capture_busy
+            if capture_busy:
+                return
+            capture_busy = True
+            result_info.set("Lendo XML do telefone…")
+            capture_button.configure(state="disabled")
+
+            def read_xml() -> None:
+                nonlocal capture_source
+                values: list[dict[str, str]] = []
+                truncated = False
+                error_text = ""
+                try:
+                    adb = Adb()
+                    adb.path, adb.serial = self.adb.path, capture_serial
+                    root = ET.fromstring(adb.capture_ui_xml(retries=4))
+                    capture_source = adb.last_xml_capture_source
+                    for node in root.iter("node"):
+                        attrs = dict(node.attrib)
+                        if not self._xml_searchable(attrs):
+                            continue
+                        values.append(attrs)
+                        if len(values) >= 10_000:
+                            truncated = True
+                            break
+                except Exception as error:
+                    error_text = str(error)
+
+                def finish() -> None:
+                    nonlocal capture_busy
+                    if not dialog.winfo_exists():
+                        return
+                    capture_busy = False
+                    capture_button.configure(state="normal")
+                    if error_text:
+                        result_info.set(f"Não foi possível capturar o XML: {error_text}")
+                        return
+                    captured[:] = values
+                    render_results()
+                    if truncated:
+                        result_info.set(f"{len(filtered)} resultado(s) exibido(s), limitado a 10.000 para manter o programa estável.")
+
+                self.after(0, finish)
+
+            self._thread(read_xml)
 
         def choose(_event=None):
             if not elements.curselection() or not filtered: return
@@ -10279,6 +13002,12 @@ class MacroApp(tk.Tk):
             except ValueError:
                 messagebox.showwarning("XML", "Informe um tempo de espera válido.", parent=dialog); return
             try:
+                wait_min, wait_max = max(0, int(tap_wait_min.get())), max(0, int(tap_wait_max.get()))
+                if wait_max < wait_min:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("XML", "Antes de tocar, use valores em ms com máximo maior ou igual ao mínimo.", parent=dialog); return
+            try:
                 fallback_x = int(unavailable_x.get()) if unavailable_tap.get() else None
                 fallback_y = int(unavailable_y.get()) if unavailable_tap.get() else None
             except ValueError:
@@ -10292,6 +13021,7 @@ class MacroApp(tk.Tk):
                 existing.selector_blocked_text = selector_blocked_text.get().strip() or None
                 existing.match_mode = "exact" if exact_choice else "contains"
                 existing.timeout_s = wait
+                existing.xml_tap_wait_min_ms, existing.xml_tap_wait_max_ms = wait_min, wait_max
                 existing.xml_unavailable_tap_x, existing.xml_unavailable_tap_y = fallback_x, fallback_y
                 item = (f"a:{action_ref[0]}:{action_ref[1]}" if action_ref is not None
                         else tree_ref if tree_ref is not None
@@ -10301,6 +13031,7 @@ class MacroApp(tk.Tk):
                                     selector_value=json.dumps(exact_choice, ensure_ascii=False, sort_keys=True) if exact_choice else value,
                                     selector_blocked_text=selector_blocked_text.get().strip() or None,
                                     match_mode="exact" if exact_choice else "contains", timeout_s=wait,
+                                    xml_tap_wait_min_ms=wait_min, xml_tap_wait_max_ms=wait_max,
                                     xml_unavailable_tap_x=fallback_x, xml_unavailable_tap_y=fallback_y)
                 # XML de toque também precisa congelar a configuração de
                 # variação vigente no momento em que é criado. A posição
@@ -10325,8 +13056,9 @@ class MacroApp(tk.Tk):
         elements.bind("<<ListboxSelect>>", choose)
         elements.bind("<Double-Button-1>", use_selected)
         elements.bind("<Button-3>", use_exact)
-        ctk.CTkButton(dialog, text="Capturar elementos XML", command=capture, width=180, height=32, corner_radius=8,
-                       fg_color="#39455b", hover_color="#4a5870").grid(row=6, column=0, padx=18, pady=12, sticky="w")
+        capture_button = ctk.CTkButton(dialog, text="Capturar elementos XML", command=capture, width=180, height=32, corner_radius=8,
+                                       fg_color="#39455b", hover_color="#4a5870")
+        capture_button.grid(row=6, column=0, padx=18, pady=12, sticky="w")
         ctk.CTkButton(dialog, text="Escolher na prévia", command=pick_from_preview, width=150, height=32, corner_radius=8,
                       fg_color="#39455b", hover_color="#4a5870").grid(row=6, column=2, padx=8, pady=12)
         ctk.CTkButton(dialog, text="Salvar alteração" if editing else "Adicionar etapa", command=add, width=150, height=32, corner_radius=8,
@@ -10419,7 +13151,7 @@ class MacroApp(tk.Tk):
         group_name = tk.StringVar(value=str(existing.get("name", f"XML condicional {sum(bool(g.get('xml_logic_group')) for g in groups) + 1}")))
         query = tk.StringVar(value=str(existing.get("xml_logic_query", "")))
         blocked = tk.StringVar(value=str(existing.get("xml_logic_blocked_text", "")))
-        timeout = tk.StringVar(value=str(existing.get("xml_logic_timeout_s", 3)))
+        timeout = tk.StringVar(value=str(existing.get("xml_logic_timeout_s", 10)))
         ttk.Label(dialog, text="Nome do grupo:").grid(row=0, column=0, padx=18, pady=(18, 8), sticky="w")
         ctk.CTkEntry(dialog, textvariable=group_name, width=430, height=32, corner_radius=8, fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=1, padx=8, pady=(18, 8), sticky="w")
         ttk.Label(dialog, text="Texto para procurar no XML:").grid(row=1, column=0, padx=18, pady=8, sticky="w")
@@ -10434,6 +13166,7 @@ class MacroApp(tk.Tk):
         info = tk.StringVar(value="Digite e capture o XML para conferir os resultados. O grupo não toca no resultado: ele somente verifica.")
         ttk.Label(dialog, textvariable=info, wraplength=700).grid(row=5, column=0, columnspan=3, padx=18, sticky="w")
         captured: list[dict[str, str]] = []
+        capture_source = ""
         def render(*_args):
             elements.delete(0, tk.END); term = query.get().strip().casefold(); count = 0
             for attrs in captured:
@@ -10442,11 +13175,15 @@ class MacroApp(tk.Tk):
                 if blocked.get().strip() and self._xml_query_matches(searchable, blocked.get().strip()): continue
                 shown = attrs.get("text") or attrs.get("content-desc") or attrs.get("resource-id") or attrs.get("class", "elemento")
                 elements.insert(tk.END, f"{shown}   [{attrs.get('class', '')}]"); count += 1
-            if captured: info.set(f"{count} resultado(s). Se houver resultado na execução, as etapas deste grupo serão executadas.")
+            if captured:
+                info.set(f"{count} resultado(s), XML capturado via {xml_capture_source_label(capture_source)}. Se houver resultado na execução, as etapas deste grupo serão executadas.")
         def capture():
+            nonlocal capture_source
             try:
                 captured.clear()
-                for node in ET.fromstring(self.adb.ui_xml()).iter("node"):
+                xml = self.adb.capture_ui_xml(retries=4)
+                capture_source = self.adb.last_xml_capture_source
+                for node in ET.fromstring(xml).iter("node"):
                     attrs = dict(node.attrib)
                     if self._xml_searchable(attrs):
                         captured.append(attrs)
@@ -10530,21 +13267,88 @@ class MacroApp(tk.Tk):
         dialog.after(100, query_entry.focus_set)
         query_entry.bind("<Return>", lambda _event: (save(), "break")[1])
 
+    def add_xml_list_action(self, action_override: Action | None = None, tree_item: str | None = None) -> None:
+        """Cria uma etapa que exige todos os XMLs ou uma quantidade mínima."""
+        editing = action_override is not None
+        action = action_override or Action("xml_list", label="Lista de XMLs", delay_ms=0,
+                                          xml_list_queries=[], branch_actions=[])
+        dialog = tk.Toplevel(self)
+        dialog.title("Lista de XMLs")
+        dialog.geometry("650x500")
+        dialog.configure(bg="#171b26")
+        dialog.transient(self); dialog.grab_set()
+        dialog.grid_columnconfigure(1, weight=1)
+        name = tk.StringVar(value=action.label or "Lista de XMLs")
+        mode = tk.StringVar(value="minimum" if action.xml_list_mode == "minimum" else "all")
+        minimum = tk.StringVar(value=str(max(1, int(action.xml_list_min_matches or 1))))
+        timeout = tk.StringVar(value=str(max(1, int(action.timeout_s or 10))))
+        ttk.Label(dialog, text="Nome da etapa:").grid(row=0, column=0, padx=18, pady=(18, 8), sticky="w")
+        ctk.CTkEntry(dialog, textvariable=name, width=420, height=32, corner_radius=8, fg_color="#222938", border_color="#465166", text_color="#f8fafc").grid(row=0, column=1, padx=8, pady=(18, 8), sticky="ew")
+        ttk.Label(dialog, text="XMLs para validar (um por linha):").grid(row=1, column=0, columnspan=2, padx=18, pady=(8, 3), sticky="w")
+        queries = tk.Text(dialog, height=10, width=62, bg="#222938", fg="#f8fafc", insertbackground="#f8fafc", relief="flat")
+        queries.grid(row=2, column=0, columnspan=2, padx=18, pady=(0, 10), sticky="ew")
+        queries.insert("1.0", "\n".join(str(value) for value in (action.xml_list_queries or [])))
+        ttk.Label(dialog, text="Critério:").grid(row=3, column=0, padx=18, pady=7, sticky="w")
+        options = ctk.CTkFrame(dialog, fg_color="transparent")
+        options.grid(row=3, column=1, padx=8, pady=7, sticky="w")
+        ctk.CTkRadioButton(options, text="Todos os XMLs", variable=mode, value="all").pack(side="left", padx=(0, 18))
+        ctk.CTkRadioButton(options, text="Quantidade mínima", variable=mode, value="minimum").pack(side="left")
+        ttk.Label(dialog, text="Quantidade mínima / espera (s):").grid(row=4, column=0, padx=18, pady=7, sticky="w")
+        fields = ctk.CTkFrame(dialog, fg_color="transparent")
+        fields.grid(row=4, column=1, padx=8, pady=7, sticky="w")
+        ctk.CTkEntry(fields, textvariable=minimum, width=70, height=30, corner_radius=8, fg_color="#222938", border_color="#465166", text_color="#f8fafc").pack(side="left")
+        ttk.Label(fields, text="     ").pack(side="left")
+        ctk.CTkEntry(fields, textvariable=timeout, width=70, height=30, corner_radius=8, fg_color="#222938", border_color="#465166", text_color="#f8fafc").pack(side="left")
+        info = "Quando o critério for atingido, as etapas dentro desta Lista serão executadas. Dentro de um Nav-S, ela é usada quando as validações normais não forem encontradas; se o XML ficar indisponível, o Nav-S tenta um arrasto e, se continuar indisponível, executa esta rota e encerra o Nav-S."
+        ttk.Label(dialog, text=info, wraplength=600).grid(row=5, column=0, columnspan=2, padx=18, pady=(8, 12), sticky="w")
+
+        def save():
+            values = [line.strip() for line in queries.get("1.0", tk.END).splitlines() if line.strip()]
+            try:
+                needed, wait = int(minimum.get()), int(timeout.get())
+                if not values or needed < 1 or wait < 1 or (mode.get() == "minimum" and needed > len(values)):
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Lista de XMLs", "Informe XMLs, uma quantidade válida e um tempo de espera válido.", parent=dialog)
+                return
+            self.push_undo()
+            action.label = name.get().strip() or "Lista de XMLs"
+            action.xml_list_queries, action.xml_list_mode = values, mode.get()
+            action.xml_list_min_matches, action.timeout_s, action.delay_ms = needed, wait, 0
+            if not editing:
+                self._insert_new_action(action)
+            self.refresh_tree()
+            target = tree_item or getattr(self, "last_inserted_tree_item", "")
+            if target and self.tree.exists(target):
+                self.tree.selection_set(target); self.tree.focus(target); self.tree.see(target)
+            self.save_macro(); dialog.destroy()
+            self.status.set("Lista de XMLs salva. Adicione as etapas dentro dela.")
+
+        ctk.CTkButton(dialog, text="Salvar etapa" if editing else "Criar etapa", command=save, width=140, height=32, corner_radius=8, fg_color="#2f6fed", hover_color="#4b82ee").grid(row=6, column=1, padx=18, pady=12, sticky="e")
+        dialog.after(100, queries.focus_set)
+
     def _load_names(self) -> dict[str, str]:
         try:
             data = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
             if not isinstance(data, dict): return {}
-            # Perfis antigos usavam um único modelo. Ele passa a valer para os
-            # dois painéis até que o usuário configure cada um separadamente.
+            # Cada telefone possui um único modelo. Estruturas antigas por
+            # painel são migradas para esse valor comum.
             profiles = {}
             for serial, value in data.items():
                 entry = dict(value) if isinstance(value, dict) else {"name": str(value), "model": ""}
-                legacy_model = str(entry.get("model", ""))
                 configured = entry.get("models_by_panel")
-                entry["models_by_panel"] = dict(configured) if isinstance(configured, dict) else {}
-                entry.setdefault("model_criar", legacy_model)
-                entry.setdefault("model_aquecer", legacy_model)
-                entry.setdefault("model_treinar", legacy_model)
+                configured = configured if isinstance(configured, dict) else {}
+                candidates = [entry.get("model")]
+                active_panel = str(entry.get("active_panel", "")).strip()
+                if active_panel:
+                    candidates.append(configured.get(active_panel))
+                candidates.extend(configured.get(panel) for panel in ("criar", "postar", "aquecer", "treinar"))
+                candidates.extend(entry.get(key) for key in ("model_criar", "model_aquecer", "model_treinar"))
+                entry["model"] = next((str(item).strip() for item in candidates if str(item or "").strip()), "")
+                entry.pop("models_by_panel", None)
+                entry.pop("model_criar", None)
+                entry.pop("model_aquecer", None)
+                entry.pop("model_treinar", None)
                 entry.setdefault("active", False)
                 entry.setdefault("keep_screen_on", False)
                 profiles[serial] = entry
@@ -10562,16 +13366,9 @@ class MacroApp(tk.Tk):
         return key or "sem_modelo"
 
     def _profile_model(self, saved: dict, fallback: str, panel: str) -> str:
-        configured = saved.get("models_by_panel", {})
-        if isinstance(configured, dict) and panel in configured:
-            return str(configured[panel]).strip()
-        # Compatibilidade com os três painéis antigos.
-        legacy_key = {"criar": "model_criar", "aquecer": "model_aquecer", "treinar": "model_treinar"}.get(panel)
-        if legacy_key and legacy_key in saved:
-            return str(saved[legacy_key]).strip()
-        if "model" in saved:
-            return str(saved["model"]).strip()
-        return fallback
+        # ``panel`` é mantido para não quebrar os chamadores, mas não
+        # participa da escolha: modelo é propriedade do telefone.
+        return str(saved.get("model") or fallback or "").strip()
 
     def _load_settings(self) -> dict:
         try:
@@ -10802,6 +13599,11 @@ class MacroApp(tk.Tk):
             self.device_list.activate(index)
             self.device_list.see(index)
             self.populate_profile()
+            # A restauração precisa seguir o mesmo caminho da inicialização:
+            # aguardar a janela já reservada do serial, sem exigir que a pessoa
+            # clique ou troque para outro celular.
+            self.after_idle(lambda target=wanted_serial:
+                            self._start_initial_live_view_when_pool_ready(target))
             return True
         return False
 
@@ -11012,15 +13814,17 @@ class MacroApp(tk.Tk):
         dialog.minsize(620, 280)
         dialog.configure(bg="#171b26")
         dialog.transient(self)
+        content = tk.Frame(dialog, bg="#171b26")
+        content.pack(fill="both", expand=True)
         columns = ("nome", "celular", "adicionado")
-        table = ttk.Treeview(dialog, columns=columns, show="headings")
+        table = ttk.Treeview(content, columns=columns, show="headings")
         table.heading("nome", text="Nome e sobrenome")
         table.heading("celular", text="Celular")
         table.heading("adicionado", text="Adicionado em")
         table.column("nome", width=250, anchor="w")
         table.column("celular", width=190, anchor="center")
         table.column("adicionado", width=210, anchor="center")
-        scrollbar = ttk.Scrollbar(dialog, orient="vertical", command=table.yview)
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=table.yview)
         table.configure(yscrollcommand=scrollbar.set)
         table.pack(side="left", fill="both", expand=True, padx=(14, 0), pady=14)
         scrollbar.pack(side="right", fill="y", padx=(0, 14), pady=14)
@@ -11031,6 +13835,34 @@ class MacroApp(tk.Tk):
         if not valid:
             table.insert("", "end", values=("Nenhum nome aguardando.", "", ""))
 
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill="x", padx=14, pady=(0, 14))
+
+        def copy_waiting_usernames() -> None:
+            usernames: list[str] = []
+            invalid_names: list[str] = []
+            for item in valid:
+                first_name = str(item.get("nome", "")).strip()
+                last_name = str(item.get("sobrenome", "")).strip()
+                try:
+                    usernames.append("@" + instagram_username_for(first_name, last_name))
+                except ValueError:
+                    invalid_names.append(f"{first_name} {last_name}".strip())
+            if not usernames:
+                messagebox.showwarning("Aguardando", "Não há @s válidos para copiar.", parent=dialog)
+                return
+            dialog.clipboard_clear()
+            dialog.clipboard_append("\n".join(usernames))
+            dialog.update()
+            copied_status.set(f"{len(usernames)} @s copiado(s), um por linha.")
+            if invalid_names:
+                copied_status.set(f"{len(usernames)} @s copiado(s); {len(invalid_names)} nome(s) sem @ válido foram ignorados.")
+
+        copied_status = tk.StringVar(value="")
+        ctk.CTkButton(footer, text="Copiar @s (um por linha)", command=copy_waiting_usernames,
+                      width=190, height=32, fg_color="#2f6fed", hover_color="#4b82ee").pack(side="left")
+        ctk.CTkLabel(footer, textvariable=copied_status, text_color="#aebbd0").pack(side="left", padx=12)
+
     def save_nickname(self) -> None:
         chosen = self.selected_profiles()
         nickname, model = self.nickname_var.get().strip(), self.model_var.get().strip()
@@ -11040,10 +13872,11 @@ class MacroApp(tk.Tk):
         serial = chosen[0]["serial"]
         profile = dict(self.saved_names.get(serial, {}))
         profile["name"] = nickname
-        profile.setdefault("models_by_panel", {})[self.flow_var.get()] = model
-        # Mantém a compatibilidade com arquivos antigos e torna o modelo
-        # escolhido visível mesmo antes de trocar de painel.
         profile["model"] = model
+        profile.pop("models_by_panel", None)
+        profile.pop("model_criar", None)
+        profile.pop("model_aquecer", None)
+        profile.pop("model_treinar", None)
         profile.setdefault("active", False)
         self.saved_names[serial] = profile
         self._save_names()
@@ -11208,15 +14041,10 @@ class MacroApp(tk.Tk):
             saved = self.saved_names.get(profile["serial"], {})
             self.device_model = self._profile_model(saved, profile["model"], panel)
             self.model_var.set(self.device_model)
-        self.load_model_groups(panel, self.device_model)
+        self._ensure_model_groups_loaded(panel, self.device_model)
         self.refresh_tree()
         self._paint_flow_buttons()
         self._sync_active_switches_for_panel()
-        # A mudança de painel não depende de uma nova seleção de linha para
-        # restabelecer a tela ao vivo do telefone já selecionado.
-        if (getattr(self, "app_view_var", None) and self.app_view_var.get() == "fluxo"
-                and len(chosen) == 1 and chosen[0].get("state") == "device"):
-            self.after_idle(lambda serial=chosen[0]["serial"]: self._start_live_view_when_preview_ready(serial))
         self.status.set(f"Painel selecionado: {self.panel_name(panel)}.")
 
     def select_flow(self, flow: str) -> None:
@@ -11498,8 +14326,8 @@ class MacroApp(tk.Tk):
         # visivel para permitir executar todos juntos.
         if len(groups) == 1:
             self.device_model = next(iter(groups))
-            self.load_model_groups(self.flow_var.get(), self.device_model)
-            self.refresh_tree()
+            if self._ensure_model_groups_loaded(self.flow_var.get(), self.device_model):
+                self.refresh_tree()
         if len(chosen) != 1:
             return
         profile = chosen[0]
@@ -11510,19 +14338,21 @@ class MacroApp(tk.Tk):
         self.model_var.set(self._profile_model(saved, profile["model"], self.flow_var.get()))
         self.device_active_var.set(bool(saved.get("active", False)) and str(saved.get("active_panel", "")) == self.flow_var.get())
         self.adb.serial = profile["serial"]
-        self.device_model = profile["group"]
+        self.device_model = self._profile_model(saved, profile["model"], self.flow_var.get())
         # A visualização ao vivo acompanha o telefone que a pessoa escolheu.
         # Só reinicia quando o serial mudou, evitando piscar ao atualizar a UI.
         # No modo Fluxo, a prévia ao vivo deve sempre acompanhar o aparelho
         # selecionado. Não depende de uma visualização anterior estar aberta.
         in_flow = not getattr(self, "app_view_var", None) or self.app_view_var.get() == "fluxo"
-        if in_flow and profile.get("state") == "device":
+        if (in_flow and not self.device_visual_pool_loading
+                and profile.get("state") == "device"):
             # A troca de painel e a seleção do telefone recriam partes da
             # interface. Aguarde o quadro de prévia, não um tempo fixo, para
             # a tela sempre abrir no lugar certo e acompanhar o selecionado.
             self.after_idle(lambda serial=profile["serial"]: self._start_live_view_when_preview_ready(serial))
 
     def macro_for(self, panel: str, model: str, only_group_name: str | None = None,
+                  only_group_index: int | None = None,
                   start_group_index: int | None = None, start_action_index: int = 0,
                   start_inside_special_group: bool = False,
                   start_nested_parent_index: int | None = None,
@@ -11618,6 +14448,19 @@ class MacroApp(tk.Tk):
                     flattened.append(raw)
             return flattened
 
+        def bind_loop_restart_group(values: list[dict] | None, loop_group: int) -> None:
+            """Vincula cada condição de reinício ao seu controlador Loop XML."""
+            for raw in values or []:
+                if not isinstance(raw, dict):
+                    continue
+                if raw.get("kind") == "xml_restart_loop":
+                    raw["loop_restart_group"] = loop_group
+                for child_key in ("branch_actions", "nested_actions", "nav_actions",
+                                  "nav_after_actions", "nav_rc_actions"):
+                    children = raw.get(child_key)
+                    if isinstance(children, list):
+                        bind_loop_restart_group(children, loop_group)
+
         def runtime_group_actions(group: dict, group_index: int) -> list[dict]:
             """Prepara um grupo especial sem perder o caminho visual real.
 
@@ -11635,6 +14478,8 @@ class MacroApp(tk.Tk):
                     raw["flow_action_index"] = int(parts[2])
                 except (IndexError, ValueError):
                     raw["flow_action_index"] = None
+            if group.get("xml_restart_loop_group"):
+                bind_loop_restart_group(prepared, group_index)
             return prepared
 
         def nested_tree_item(group_index: int, path: list[int]) -> str | None:
@@ -11850,6 +14695,12 @@ class MacroApp(tk.Tk):
         for group_index, group in enumerate(groups):
             if only_group_name is not None and group["name"] != only_group_name:
                 continue
+            # O nome é apenas um rótulo editável; grupos especiais podem ter
+            # nomes iguais. A execução isolada usa o índice estrutural para
+            # garantir que Shift+duplo clique rode exatamente o controlador
+            # (Loop, Nav, XML etc.) que foi clicado.
+            if only_group_index is not None and group_index != only_group_index:
+                continue
             if only_group_name is None and start_group_index is not None and group_index < start_group_index:
                 continue
             if group.get("branch_only") and only_group_name is None:
@@ -11866,10 +14717,12 @@ class MacroApp(tk.Tk):
                 loop_actions = runtime_from_nested_path(group.get("actions", []), start_nested_path,
                                                         f"a:{group_index}")
                 full_loop_actions = runtime_group_actions(group, group_index)
+                bind_loop_restart_group(loop_actions, group_index)
                 actions.append(Action(
                     "xml_restart_loop", label=group["name"],
                     branch_actions=loop_actions,
                     loop_restart_actions=full_loop_actions,
+                    loop_restart_group=group_index,
                     nav_min_rounds=max(1, int(group.get("xml_restart_loop_min_rounds", 1))),
                     nav_max_rounds=max(1, int(group.get("xml_restart_loop_max_rounds", 1))),
                     flow_group=group_index, enabled=bool(group.get("enabled", True)),
@@ -11948,7 +14801,7 @@ class MacroApp(tk.Tk):
                 actions.append(Action("xml_logic", label=group["name"],
                                       selector_value=str(group.get("xml_logic_query") or ""),
                                       selector_blocked_text=str(group.get("xml_logic_blocked_text") or ""),
-                                      timeout_s=float(group.get("xml_logic_timeout_s", 3)),
+                                      timeout_s=float(group.get("xml_logic_timeout_s", 10)),
                                       branch_actions=conditional_actions, flow_group=group_index,
                                       enabled=bool(group.get("enabled", True))))
                 continue
@@ -11971,13 +14824,14 @@ class MacroApp(tk.Tk):
                 actions.append(Action("validation_loop", label=group["name"], branch_actions=loop_actions,
                                       selector_value=str(group.get("validation_loop_query") or ""),
                                       selector_blocked_text=str(group.get("validation_loop_blocked_text") or ""),
-                                      timeout_s=max(0.1, float(group.get("validation_loop_timeout_s", 3))),
+                                      timeout_s=max(0.1, float(group.get("validation_loop_timeout_s", 10))),
                                       flow_group=group_index, enabled=bool(group.get("enabled", True))))
                 continue
             if group.get("xml_restart_loop_group"):
                 loop_actions = runtime_group_actions(group, group_index)
                 actions.append(Action("xml_restart_loop", label=group["name"], branch_actions=loop_actions,
                                       loop_restart_actions=loop_actions,
+                                      loop_restart_group=group_index,
                                       nav_min_rounds=max(1, int(group.get("xml_restart_loop_min_rounds", 1))),
                                       nav_max_rounds=max(1, int(group.get("xml_restart_loop_max_rounds", 1))),
                                       flow_group=group_index, enabled=bool(group.get("enabled", True)),
@@ -12058,7 +14912,7 @@ class MacroApp(tk.Tk):
                 actions.append(Action("navigate_s", label=group["name"], delay_ms=max(0, int(group.get("nav_start_delay_ms", 0))), nav_actions=recorded,
                                       nav_s_query=str(group.get("nav_s_query") or ""),
                                       nav_s_third_query=str(group.get("nav_s_third_query") or ""),
-                                      nav_s_verify_timeout_s=float(group.get("nav_s_verify_timeout_s", 3)),
+                                      nav_s_verify_timeout_s=float(group.get("nav_s_verify_timeout_s", 10)),
                                       nav_min_s=float(group.get("nav_min_s", 12)), nav_max_s=float(group.get("nav_max_s", 20)),
                                       nav_pause_min_ms=int(group.get("nav_pause_min_ms", 350)), nav_pause_max_ms=int(group.get("nav_pause_max_ms", 750)),
                                       nav_tap_interval_min_ms=int(group.get("nav_tap_interval_min_ms", 120)),
@@ -12081,9 +14935,27 @@ class MacroApp(tk.Tk):
             for action_index, action in enumerate(group_actions, action_offset):
                 append_action_with_subgroups(action, group_index, action_index, bool(group.get("enabled", True)),
                                              f"a:{group_index}:{action_index}", root_gates)
+        # Controladores de grupos especiais (Nav-R/Nav-S, Loop XML, XML
+        # condicional etc.) não tinham um caminho visual próprio. Quando um
+        # evento chegava antes da primeira etapa interna, o destaque caía no
+        # índice superior disponível. Todo controlador passa a apontar ao seu
+        # cabeçalho; assim, ao entrar nele a árvore abre o grupo correto e as
+        # etapas filhas substituem esse destaque normalmente.
+        for runtime_action in actions:
+            if runtime_action.flow_group is not None and not runtime_action.tree_item:
+                runtime_action.tree_item = f"g:{runtime_action.flow_group}"
         return actions, tuple(data.get("screen", self.screen)), data.get("device", {}).get("raw_size")
 
+    def _ensure_model_groups_loaded(self, panel: str, model: str) -> bool:
+        """Carrega do disco apenas quando painel ou modelo realmente mudou."""
+        key = (str(panel), self._model_file_key(str(model)))
+        if self._loaded_macro_key == key:
+            return False
+        self.load_model_groups(panel, model)
+        return True
+
     def load_model_groups(self, panel: str, model: str) -> None:
+        self._loaded_macro_key = (str(panel), self._model_file_key(str(model)))
         filename = f"{self._model_file_key(model)}_{panel}.json"
         path = MACROS_DIR / filename
         if not path.exists():
@@ -12125,8 +14997,21 @@ class MacroApp(tk.Tk):
 
     @staticmethod
     def _groups_from_data(data: dict, migrate_inline_nav_s: bool = True) -> list[dict]:
+        # Arquivos de versão guardam o fluxo dentro de ``macro``.  Aceitá-los
+        # aqui evita uma árvore vazia se uma versão for aberta/recuperada como
+        # se fosse o arquivo normal do modelo.
+        if isinstance(data, dict) and "groups" not in data and isinstance(data.get("macro"), dict):
+            data = data["macro"]
+
         def read_action(value: dict | Action) -> Action:
             action = value if isinstance(value, Action) else Action(**value)
+            # A espera padrão de procura XML é 10 s para etapas novas e
+            # já gravadas. Aplicar durante a leitura alcança também XMLs
+            # dentro de subgrupos, Navs e loops sem editar cada arquivo à mão.
+            if action.kind in {"xml_tap", "xml_group_gate", "xml_restart_loop", "xml_logic", "xml_any_tap", "xml_list"}:
+                action.timeout_s = 10
+            if action.kind == "navigate_s":
+                action.nav_s_verify_timeout_s = 10.0
             # A opção antiga "Abrir Instagram" foi unificada com a etapa que
             # instala e abre. Macros já salvas continuam funcionando, agora com
             # a mesma recuperação de instalação e abertura da etapa atual.
@@ -12135,8 +15020,21 @@ class MacroApp(tk.Tk):
                 action.package_name = "com.instagram.android"
                 action.install_if_missing = True
                 action.label = "Instagram: instalar e abrir"
-            if action.nested_actions is not None:
-                action.nested_actions = [read_action(item) for item in action.nested_actions]
+            # Migra as antigas etapas fixas de Heloisa para a nova estrutura
+            # de identidades. O caminho antigo vira apenas uma pista para a
+            # categoria; na execução a mídia virá da identidade sorteada.
+            if action.kind == "random_user_files" and not action.identity_media_type:
+                legacy = " ".join([str(action.label or ""), *[str(path) for path in (action.file_paths or [])]]).casefold()
+                if "verificacao" in legacy or "verificação" in legacy:
+                    action.identity_media_type = "verificacao"
+                elif "story" in legacy:
+                    action.identity_media_type = "story"
+                elif "selfie" in legacy or "perfil" in legacy:
+                    action.identity_media_type = "perfil"
+            for child_field in ("nested_actions", "branch_actions", "nav_actions", "nav_rc_actions", "nav_after_actions"):
+                child_actions = getattr(action, child_field)
+                if child_actions is not None:
+                    setattr(action, child_field, [read_action(item) for item in child_actions])
             return action
 
         if "groups" in data:
@@ -12156,6 +15054,15 @@ class MacroApp(tk.Tk):
 
         # Macros antigas também passam a respeitar o intervalo mínimo.
         for group in groups:
+            # Os controladores de grupo guardam o próprio tempo fora de
+            # ``Action``. Normalizá-los aqui garante 10 s também para macros
+            # já gravadas, Nav-S, loops e XML condicional.
+            if group.get("xml_logic_group"):
+                group["xml_logic_timeout_s"] = 10.0
+            if group.get("validation_loop"):
+                group["validation_loop_timeout_s"] = 10.0
+            if group.get("navigation_s"):
+                group["nav_s_verify_timeout_s"] = 10.0
             # Nas primeiras versões de subgrupos, ao adicionar XML após um
             # Nav-S dentro de Treino, ele era salvo como etapa irmã. Migra o
             # bloco contíguo de XML para dentro do Nav-S, preservando a ordem
@@ -12397,6 +15304,9 @@ class MacroApp(tk.Tk):
         Ex.: `Story de 1 de 16` encontra `Story de joao, 1 de 16`.
         `Concordo .button` encontra o texto Concordo em um Button, mesmo que
         a classe venha antes do texto na ordem dos atributos XML.
+
+        Números são palavras inteiras: procurar `2 de` não pode encontrar o
+        `2` que faz parte de um usuário como `marciellyolv2`.
         """
         normalized_query = re.sub(r"[_/:.\\-]+", " ", query.casefold())
         terms = re.findall(r"\w+", normalized_query, flags=re.UNICODE)
@@ -12414,12 +15324,18 @@ class MacroApp(tk.Tk):
             "recyclerview", "scrollview", "linearlayout", "framelayout",
             "viewpager", "checkbox", "switch", "spinner", "layout", "view",
         }
+        def term_pattern(term: str) -> str:
+            # Mantém a pesquisa parcial para palavras ("avanç" encontra
+            # "Avançar"), mas um número digitado pelo usuário só corresponde
+            # ao próprio número, nunca a um dígito dentro de outro token.
+            escaped = re.escape(term)
+            return rf"(?<!\w){escaped}(?!\w)" if term.isdecimal() else escaped
         if "." in query or any(term in widget_terms for term in terms):
-            return all(re.search(re.escape(term), normalized_searchable) is not None for term in terms)
+            return all(re.search(term_pattern(term), normalized_searchable) is not None for term in terms)
         # Cada termo precisa ocorrer depois do anterior. O trecho entre eles
         # é livre (normalmente o nome variável do Story), mas `0 de 16` não
         # passa quando a busca pede `1 de 16`.
-        pattern = r".*?".join(re.escape(term) for term in terms)
+        pattern = r".*?".join(term_pattern(term) for term in terms)
         return re.search(pattern, normalized_searchable, flags=re.DOTALL) is not None
 
     @staticmethod
@@ -12555,34 +15471,142 @@ class MacroApp(tk.Tk):
                 ancestor = parent_map.get(ancestor)
         return None
 
+    def refresh_connected_devices_and_views(self) -> None:
+        """Atualiza ADB, lista, grade e telas vivas pela mesma operaÃ§Ã£o.
+
+        As janelas scrcpy continuam sendo as reservas jÃ¡ abertas; aqui sÃ³
+        reenviamos cada uma ao seu host correto. Assim o botÃ£o Atualizar nÃ£o
+        deixa um vÃ­deo velho/preto nem cria outro processo para o telefone.
+        """
+        self.status.set("Atualizando celulares conectados e visualizaÃ§Ãµesâ€¦")
+
+        def refresh_live_views_after_devices() -> None:
+            profiles = [profile for profile in self.device_profiles.values()
+                        if profile.get("state") == "device"]
+            in_grid = bool(getattr(self, "app_view_var", None)
+                           and self.app_view_var.get() == "celulares")
+            if in_grid:
+                # O evento de dispositivos jÃ¡ refez os cartÃµes. Um scrcpy que
+                # acabou de reconectar pode criar a janela SDL alguns segundos
+                # depois de o ADB voltar a responder. Repetimos a reconciliaÃ§Ã£o
+                # por um curto perÃ­odo: cada tentativa apenas encaixa a mesma
+                # reserva no host atual (ou a recria se ela tiver terminado),
+                # nunca abre uma tela duplicada. Antes, a primeira tentativa
+                # podia acontecer cedo demais e a janela ficava solta na barra
+                # de tarefas atÃ© a pessoa sair e entrar novamente em Celulares.
+                session = self.grid_view_session
+
+                def reattach_grid_views() -> None:
+                    if (session != self.grid_view_session
+                            or not getattr(self, "app_view_var", None)
+                            or self.app_view_var.get() != "celulares"):
+                        return
+                    self.update_idletasks()
+                    current_profiles = [profile for profile in self.device_profiles.values()
+                                        if profile.get("state") == "device"]
+                    self._start_grid_live_views(current_profiles, session)
+                    for serial, process in tuple(self.grid_scrcpy_processes.items()):
+                        if process.poll() is None:
+                            self._place_grid_live_view(serial, process.pid, session)
+
+                # A primeira tentativa cobre os aparelhos que jÃ¡ voltaram;
+                # as demais cobrem a inicializaÃ§Ã£o lenta do servidor SDL apÃ³s
+                # desconectar/reconectar o cabo, sem exigir mudar de tela.
+                for delay in (90, 450, 1200, 2800):
+                    self.after(delay, reattach_grid_views)
+            else:
+                self._prepare_all_device_visuals(profiles)
+                # No Fluxo sÃ³ uma tela fica visÃ­vel, mas todas as demais
+                # permanecem aquecidas. Reencaixamos a selecionada agora.
+                selected = self.selected_profiles()
+                if len(selected) == 1 and selected[0].get("state") == "device":
+                    self.after_idle(lambda serial=str(selected[0]["serial"]):
+                                    self._start_live_view_when_preview_ready(serial))
+            self.status.set("Lista, grade e telas dos celulares foram atualizadas.")
+
+        self.refresh_devices(after_refresh=refresh_live_views_after_devices, fast=False)
+
+    def _watch_device_connections(self) -> None:
+        """Detecta em segundo plano quando um aparelho sai ou volta ao ADB."""
+        if getattr(self, "_closing_now", False):
+            return
+
+        if self.device_connection_watch_running:
+            self.after(3000, self._watch_device_connections)
+            return
+        self.device_connection_watch_running = True
+
+        def check() -> None:
+            try:
+                snapshot = self.adb.connection_snapshot()
+                self.events.put(("device_connection_snapshot", snapshot))
+            except Exception:
+                # Uma consulta falha durante a troca do cabo não deve gerar
+                # alerta; a próxima sondagem simplesmente tentará de novo.
+                pass
+            finally:
+                self.device_connection_watch_running = False
+
+        self._thread(check)
+        # Durante seis execuções há muitas chamadas ADB por serial. A consulta
+        # global de conexão continua ativa, porém menos frequente para não
+        # disputar o servidor ADB e a banda USB com as etapas em andamento.
+        self.after(7000 if self.run_active else 3000, self._watch_device_connections)
+
+    def _refresh_after_connection_change(self) -> None:
+        """Reconciliação leve usada somente pelo detector automático de cabo."""
+        if self.device_connection_refresh_pending:
+            return
+        self.device_connection_refresh_pending = True
+
+        def reattach() -> None:
+            self.device_connection_refresh_pending = False
+            profiles = [profile for profile in self.device_profiles.values()
+                        if profile.get("state") == "device"]
+            if getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares":
+                session = self.grid_view_session
+                def reattach_grid_views() -> None:
+                    if (session != self.grid_view_session or getattr(self, "_closing_now", False)
+                            or not getattr(self, "app_view_var", None)
+                            or self.app_view_var.get() != "celulares"):
+                        return
+                    current = [profile for profile in self.device_profiles.values()
+                               if profile.get("state") == "device"]
+                    # Reproduz, sem sair visualmente de Celulares, o trecho
+                    # que funciona ao passar por Fluxo: solta as janelas da
+                    # grade (mantendo as reservas) e as encaixa de novo. Isto
+                    # remove um HWND antigo que pode sobreviver ao cabo e
+                    # impede a fila de tentar várias cópias do mesmo serial.
+                    self._stop_grid_live_views(terminate=False)
+                    self._start_grid_live_views(current, session)
+                # O ADB já responde antes de o servidor de vídeo do Android
+                # estar pronto. Aguardar um instante é o mesmo intervalo que
+                # ocorria naturalmente ao usuário trocar de aba.
+                self.after(900, reattach_grid_views)
+            else:
+                self._prepare_all_device_visuals(profiles)
+
+        # Só precisamos confirmar serial/estado: rótulo do modelo e demais
+        # leituras por telefone ficam para Atualizar, sem travar seis ADBs
+        # quando alguém apenas reconecta um cabo.
+        self.refresh_devices(after_refresh=reattach, fast=True)
+
+    def _hidden_scrcpy_startupinfo(self):
+        """Impede que uma janela SDL nova apareça na barra de tarefas."""
+        try:
+            info = subprocess.STARTUPINFO()
+            info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            info.wShowWindow = 0  # SW_HIDE; _place/_embed a mostra quando pronta.
+            return info
+        except AttributeError:
+            return None
+
     def refresh_devices(self, after_refresh=None, fast: bool = False) -> None:
         """Atualiza a lista; o modo rápido só confirma conexões para iniciar logo."""
         def job():
             try:
                 known_models = {profile["serial"]: profile["model"] for profile in self.device_profiles.values()}
                 devices = self.adb.devices()
-                for serial, state in devices:
-                    if state != "device":
-                        continue
-                    if self.legacy_awake_cleanup_pending:
-                        try:
-                            adb = Adb()
-                            adb.path, adb.serial = self.adb.path, serial
-                            self._clear_legacy_auto_awake(adb)
-                        except Exception:
-                            pass
-                self.legacy_awake_cleanup_pending = False
-                # Os celulares marcados na lista voltam a ficar ligados ao
-                # reconectar ou reabrir o iggen; os demais não são alterados.
-                for serial, state in devices:
-                    if state != "device" or not bool(self.saved_names.get(serial, {}).get("keep_screen_on", False)):
-                        continue
-                    try:
-                        adb = Adb()
-                        adb.path, adb.serial = self.adb.path, serial
-                        self._keep_screen_awake(adb, serial)
-                    except Exception:
-                        pass
                 labels = []
                 for serial, state in devices:
                     if state != "device":
@@ -12594,6 +15618,32 @@ class MacroApp(tk.Tk):
                         self.device_label_cache[serial] = model
                     labels.append((serial, state, model))
                 self.events.put(("devices", (labels, after_refresh)))
+
+                # A descoberta e o scrcpy não dependem de alterar o tempo de
+                # tela do Android. Em alguns aparelhos esse ajuste demora
+                # dezenas de segundos e, antes, fazia o telefone já
+                # selecionado sequer entrar na fila de visualização. Rode a
+                # manutenção depois de publicar a lista, em paralelo.
+                def maintain_screen_awake(snapshot=list(devices)) -> None:
+                    if not self.screen_awake_watchdog_lock.acquire(blocking=False):
+                        return
+                    try:
+                        for serial, state in snapshot:
+                            if state != "device":
+                                continue
+                            try:
+                                adb = Adb()
+                                adb.path, adb.serial = self.adb.path, serial
+                                if self.legacy_awake_cleanup_pending:
+                                    self._clear_legacy_auto_awake(adb)
+                                self._keep_screen_awake(adb, serial)
+                            except Exception:
+                                continue
+                        self.legacy_awake_cleanup_pending = False
+                    finally:
+                        self.screen_awake_watchdog_lock.release()
+
+                self._thread(maintain_screen_awake)
             except Exception as e: self.events.put(("error", str(e)))
         self._thread(job)
 
@@ -12645,6 +15695,12 @@ class MacroApp(tk.Tk):
         self._thread(job)
 
     def start_recording(self, refresh_first: bool = True) -> None:
+        # A lista exibida já é suficiente para começar a capturar getevent.
+        # Reconsultar ADB e manter a tela ligada em todos os aparelhos antes
+        # de gravar criava uma rajada de comandos que atrasava justamente as
+        # execuções que já estavam rodando nos outros cartões.
+        if refresh_first and any(profile.get("state") == "device" for profile in self.device_profiles.values()):
+            refresh_first = False
         if refresh_first:
             if self.record_refresh_pending:
                 self.status.set("Atualizando os telefones antes de gravar…")
@@ -12827,7 +15883,19 @@ class MacroApp(tk.Tk):
         self.status.set("Gravação encerrada.")
         return True
 
-    def stop_all(self, panel: str | None = None) -> None:
+    def stop_all_panels(self) -> None:
+        """Ãšnica aÃ§Ã£o que interrompe todos os painÃ©is e todos os celulares."""
+        panels = tuple(self.panel_runs)
+        if not panels:
+            if self.stop_recording():
+                return
+            self.status.set("Não há gravação ou execução em andamento.")
+            return
+        for panel in panels:
+            self.stop_all(panel)
+        self.status.set("Encerrando todos os celulares e painéis…")
+
+    def stop_all(self, panel: str | None = None, *, stop_recording: bool = True) -> None:
         """Interrompe somente o painel informado (ou o painel visível)."""
         panel = str(panel or self.flow_var.get())
         panel_run = self.panel_runs.get(panel)
@@ -12860,7 +15928,7 @@ class MacroApp(tk.Tk):
             self.run_active = bool(self.panel_runs)
         elif not self.panel_runs:
             self._fallback_run_stop_event.set()
-        had_recording = self.stop_recording()
+        had_recording = self.stop_recording() if stop_recording else False
         self.select_running_step()
         # Captura também um aviso de etapa que já estava na fila da interface.
         self.after(120, self.select_running_step)
@@ -12895,11 +15963,17 @@ class MacroApp(tk.Tk):
             panel = str(getattr(self, "grid_focused_panel", "") or "")
         if not panel and global_request:
             panel = str(getattr(self, "grid_focused_panel", "") or "") if in_grid else self.flow_var.get()
-        if not panel:
-            return "break"
-        if panel not in self.panel_runs and not (self.execution_refresh_pending and panel == self.flow_var.get()):
-            return "break"
-        self.stop_all(panel)
+        target = self._current_execution_target()
+        if target:
+            target_panel, serial = target
+            active_run = self.panel_runs.get(target_panel)
+            if active_run and serial in active_run.active_serials:
+                self.stop_device_execution(serial, target_panel)
+                return "break"
+        # Para uma preparaÃ§Ã£o ainda sem worker, Esc cancela somente o painel
+        # atual. Nunca usa isso para tocar nas execuÃ§Ãµes de outros painÃ©is.
+        if panel and self.execution_refresh_pending and panel == self.flow_var.get():
+            self.stop_all(panel)
         return "break"
 
     def _poll_global_escape(self) -> None:
@@ -12925,7 +15999,10 @@ class MacroApp(tk.Tk):
                 and target is not None and target[0] in self.panel_runs):
             # Fora do app, Esc só é ativo durante automação no PC. O alvo vem
             # do worker que a iniciou, nunca do painel atualmente visível.
-            self.stop_all(target[0])
+            # Esc global existe apenas na automaÃ§Ã£o PC. O worker informa o
+            # serial exato, portanto ele nunca interrompe o outro aparelho
+            # que esteja executando no mesmo painel.
+            self.stop_device_execution(str(target[1]), str(target[0]))
             self.pc_automation_escape_target = None
         self._global_escape_was_down = is_down
         try:
@@ -12985,6 +16062,22 @@ class MacroApp(tk.Tk):
         selected = self.tree.selection()
         focused = self.tree.focus()
         item = focused if focused in selected else (selected[0] if selected else "")
+        # Shift + duplo clique também vale para o cabeçalho de um grupo,
+        # inclusive os controladores especiais (Loop, Nav, XML, validação).
+        # Nesse caso não há uma única ação para isolar: executamos somente o
+        # grupo clicado, pelo índice exato, sem avançar para os seguintes.
+        parts = item.split(":") if item else []
+        if len(parts) == 2 and parts[0] == "g":
+            try:
+                group_index = int(parts[1])
+                self.macros[self.flow_var.get()][group_index]
+            except (IndexError, KeyError, ValueError):
+                return
+            profiles = self.selected_profiles()
+            serial = str(only_serial or (profiles[0].get("serial", "") if profiles else self.adb.serial or ""))
+            self.run_macro(refresh_first=False, run_all_panels=False, only_serial=serial,
+                           only_group_index=group_index)
+            return
         location = self._tree_action_container(item) if item else None
         if location is None:
             messagebox.showwarning("Reproduzir etapa", "Selecione uma etapa, não um grupo.")
@@ -13015,7 +16108,7 @@ class MacroApp(tk.Tk):
         return "break"
 
     def execute_selected_tree_double_click(self, event):
-        """Shift + duplo clique reproduz apenas a linha clicada."""
+        """Shift + duplo clique executa a etapa ou o grupo clicado."""
         item = self.tree.identify_row(event.y)
         if not item:
             return "break"
@@ -13155,6 +16248,7 @@ class MacroApp(tk.Tk):
                        start_inside_special_group=selected_child)
 
     def run_macro(self, start_index: int = 0, refresh_first: bool = True, debug_group_name: str | None = None,
+                  only_group_index: int | None = None,
                   run_all_panels: bool = False,
                   only_serial: str | None = None,
                   start_group_index: int | None = None, start_action_index: int = 0,
@@ -13190,6 +16284,7 @@ class MacroApp(tk.Tk):
                 if request_token != self.execution_request_token or not self.execution_refresh_pending:
                     return
                 self.run_macro(start_index, refresh_first=False, debug_group_name=debug_group_name,
+                               only_group_index=only_group_index,
                                run_all_panels=run_all_panels, only_serial=only_serial,
                                start_group_index=start_group_index, start_action_index=start_action_index,
                                start_inside_special_group=start_inside_special_group,
@@ -13211,8 +16306,9 @@ class MacroApp(tk.Tk):
             return
         self.execution_refresh_pending = False
         panel = str(target_panel or self.flow_var.get())
-        if panel in self.panel_runs:
-            if self.panel_runs[panel].stop_event.is_set():
+        existing_panel_run = self.panel_runs.get(panel)
+        if existing_panel_run and not only_serial:
+            if existing_panel_run.stop_event.is_set():
                 self.status.set("Este painel ainda está encerrando. Aguarde finalizar antes de iniciar novamente.")
             else:
                 self.status.set("Este painel já está em execução.")
@@ -13252,6 +16348,7 @@ class MacroApp(tk.Tk):
             for job_panel in panels_to_run:
                 model = self._profile_model(saved, str(target.get("model", "")), job_panel)
                 found = self.macro_for(job_panel, model, only_group_name=debug_group_name,
+                                       only_group_index=only_group_index,
                                        start_group_index=start_group_index, start_action_index=start_action_index,
                                        start_inside_special_group=start_inside_special_group,
                                        start_nested_parent_index=start_nested_parent_index,
@@ -13267,6 +16364,12 @@ class MacroApp(tk.Tk):
         if not jobs:
             messagebox.showwarning("Execução", "Não há gravações nos painéis atribuídos aos telefones ativos.")
             return
+        if existing_panel_run:
+            with existing_panel_run.worker_lock:
+                busy_serials = set(existing_panel_run.active_serials)
+            if any(str(target["serial"]) in busy_serials for target, *_rest in jobs):
+                self.status.set("Este celular já está em execução neste painel.")
+                return
         total_steps = sum(sum(action.enabled for action in actions) for _, _, actions, _, _ in jobs)
         if not total_steps:
             messagebox.showwarning("Execução", "Todas as etapas selecionadas estão desativadas.")
@@ -13280,8 +16383,16 @@ class MacroApp(tk.Tk):
         self.set_running_step(None)
         self.progress_value.set(0)
         self.progress_text.set(f"0/{total_steps} etapas — 0%")
-        panel_run = PanelRun(panel=panel, total_steps=total_steps)
-        self.panel_runs[panel] = panel_run
+        panel_run = existing_panel_run or PanelRun(panel=panel, total_steps=total_steps)
+        if existing_panel_run is None:
+            self.panel_runs[panel] = panel_run
+        with panel_run.worker_lock:
+            panel_run.active_serials.update(str(target["serial"]) for target, *_rest in jobs)
+            for target, *_rest in jobs:
+                panel_run.device_stop_events[str(target["serial"])] = threading.Event()
+            panel_run.active_workers += len(jobs)
+            if existing_panel_run is not None:
+                panel_run.total_steps += total_steps
         self._fallback_run_stop_event.clear()
         self.execution_stopping = bool(self.stopping_panels)
         self.run_active = bool(self.panel_runs)
@@ -13298,11 +16409,42 @@ class MacroApp(tk.Tk):
         def worker(target_no, target, job_panel, actions, recorded_screen, raw_size):
             self._run_thread_context.panel = panel
             self._run_thread_context.run = panel_run
+            with panel_run.worker_lock:
+                self._run_thread_context.device_stop_event = panel_run.device_stop_events.get(str(target["serial"]), panel_run.stop_event)
             self._run_thread_context.serial = str(target["serial"])
             ADB_PROCESS_CONTEXT.run = panel_run
+            ADB_PROCESS_CONTEXT.serial = str(target["serial"])
+            ADB_PROCESS_CONTEXT.device_stop_event = self._run_thread_context.device_stop_event
             adb = Adb()
             adb.path = self.adb.path
             adb.serial = target["serial"]
+            reconnect_announced = False
+
+            def wait_for_device_reconnection(serial: str, stop_event) -> bool:
+                """Pausa este worker atÃ© o mesmo serial voltar ao ADB."""
+                nonlocal reconnect_announced
+                serial = str(serial)
+                if not reconnect_announced:
+                    reconnect_announced = True
+                    self.events.put(("device_connection_paused", serial))
+                    self.events.put(("status", "Celular desconectado; fluxo pausado até reconectar."))
+                while stop_event is None or not stop_event.is_set():
+                    try:
+                        connected = {item_serial: state for item_serial, state in adb.devices()}
+                        if connected.get(serial) == "device":
+                            reconnect_announced = False
+                            self.events.put(("device_connection_resumed", serial))
+                            self.events.put(("status", "Celular reconectado; retomando o fluxo automaticamente."))
+                            return True
+                    except (OSError, subprocess.SubprocessError, RuntimeError):
+                        pass
+                    if stop_event is not None and stop_event.wait(1.0):
+                        break
+                    if stop_event is None:
+                        time.sleep(1.0)
+                return False
+
+            ADB_PROCESS_CONTEXT.on_device_disconnected = wait_for_device_reconnection
             # Permite interromper imediatamente uma recuperação de XML que
             # esteja aguardando o uiautomator do aparelho voltar a responder.
             adb.xml_stop_event = self.run_stop_event
@@ -13315,6 +16457,19 @@ class MacroApp(tk.Tk):
                 self.events.put(("status", message))
 
             adb.xml_recovery_callback = report_xml_recovery
+
+            last_xml_capture_source = ""
+
+            def report_xml_capture(source: str) -> None:
+                # Uma mesma busca pode capturar dezenas de dumps. A origem é
+                # útil apenas na primeira captura; repetir só polui o log.
+                nonlocal last_xml_capture_source
+                if source == last_xml_capture_source:
+                    return
+                last_xml_capture_source = source
+                self.events.put(("log", f"XML capturado via {xml_capture_source_label(source)}."))
+
+            adb.xml_capture_callback = report_xml_capture
 
             def navigation_xml(nav_name: str) -> tuple[str, bool]:
                 """Lê XML para os ciclos Nav sem deixá-los presos para sempre.
@@ -13329,7 +16484,7 @@ class MacroApp(tk.Tk):
                 try:
                     # Navegação não deve limpar/reiniciar o uiautomator: se a
                     # leitura falhar, o Nav usa o arrasto seguro deste ciclo.
-                    xml = adb.ui_xml(timeout=4, force_root_recovery=False)
+                    xml = adb.capture_ui_xml(timeout=12, retries=3, stop_event=self.run_stop_event)
                     if xml and "<hierarchy" in xml:
                         return xml, False
                 except (OSError, subprocess.SubprocessError, RuntimeError):
@@ -13340,7 +16495,7 @@ class MacroApp(tk.Tk):
             def regular_xml(action: Action, context: str) -> tuple[str, bool]:
                 """Captura XML comum sem bloquear a contingência configurada."""
                 try:
-                    xml = adb.ui_xml(timeout=4, force_root_recovery=False)
+                    xml = adb.capture_ui_xml(timeout=12, retries=3, stop_event=self.run_stop_event)
                     if xml and "<" in xml:
                         return xml, False
                 except (OSError, subprocess.SubprocessError, RuntimeError):
@@ -13377,17 +16532,22 @@ class MacroApp(tk.Tk):
                 with whisper_capture_lock:
                     whisper_capture_error[:] = [str(error)]
 
-            def wait_for_whisper_code() -> str:
-                """Espera somente no ponto de digitação, preservando o campo ativo."""
+            def wait_for_whisper_code() -> str | None:
+                """Espera o resultado sem transformar uma falha de leitura em erro da macro."""
                 while whisper_capture_pending.is_set() and not self.run_stop_event.wait(0.15):
                     pass
                 if self.run_stop_event.is_set():
-                    raise RuntimeError("Captura Whisper interrompida.")
+                    return None
                 with whisper_capture_lock:
                     failure = whisper_capture_error[0] if whisper_capture_error else ""
                 if failure:
-                    raise RuntimeError(f"Não foi possível obter o código pelo Whisper: {failure}")
-                return runtime_variables.require("WHISPER_CODE")
+                    self.events.put(("status", "Whisper não conseguiu identificar o código; seguindo o fluxo."))
+                    return None
+                try:
+                    return runtime_variables.require("WHISPER_CODE")
+                except RuntimeError:
+                    self.events.put(("status", "Whisper não conseguiu identificar o código; seguindo o fluxo."))
+                    return None
 
             class SMSPoolCaptureCancel:
                 def is_set(_self) -> bool:
@@ -13672,7 +16832,12 @@ class MacroApp(tk.Tk):
                         return
                     else:
                         item = f"a:{group_index}:{action_index}" if action_index is not None else f"g:{group_index}"
-                    self.events.put(("running_item", (adb.serial or target["serial"], item)))
+                    # O id da execução impede que um evento atrasado de um
+                    # ciclo anterior (comum em XML) repinte esta mesma árvore
+                    # depois que uma nova execução já começou.
+                    self.events.put(("running_item", (
+                        adb.serial or target["serial"], item, panel_run.run_id,
+                    )))
 
                 def mark_loop_cycle_start(raw_actions: list[dict] | list[Action] | None,
                                           group_index: int | None) -> None:
@@ -13795,16 +16960,82 @@ class MacroApp(tk.Tk):
                             siblings.append(candidate)
                     return siblings
 
+                def ensure_nav_rc_text(context_action: Action | None = None) -> str:
+                    """Lê um comentário válido quando a macro legada só tem digitação.
+
+                    Nav-R-C antigo é salvo como subgrupo comum (XML/arrasto/
+                    toque/digitar), sem a etapa explícita de extração. A
+                    variável nunca é compartilhada: ``runtime_variables`` já
+                    pertence ao worker deste serial.
+                    """
+                    cached = str(runtime_variables.get("NAV_RC_TEXT", "")).strip()
+                    if cached:
+                        return cached
+                    marker = str(getattr(context_action, "nav_rc_marker", "") or "disse").strip() or "disse"
+                    configured_max_days = getattr(context_action, "nav_rc_max_age_days", 1)
+                    max_days = max(0, int(1 if configured_max_days is None else configured_max_days))
+                    try:
+                        current_xml = adb.try_ui_xml()
+                        extracted = (self._extract_nav_rc_text(current_xml, marker, max_days)
+                                     if current_xml else None)
+                    except (ET.ParseError, OSError, RuntimeError, ValueError) as error:
+                        self.events.put(("status", f"Nav-R-C: não foi possível ler o comentário neste telefone: {error}"))
+                        return ""
+                    if not extracted:
+                        self.events.put(("status", f"Nav-R-C: nenhum comentário com ‘{marker}’ de até {max_days} dia(s) foi encontrado; digitação ignorada."))
+                        return ""
+                    text, date_label = extracted
+                    runtime_variables.set("NAV_RC_TEXT", text)
+                    self.events.put(("status", f"Nav-R-C: texto válido extraído ({date_label}): {text}"))
+                    return text
+
+                def xml_list_is_valid(current_xml: str, list_action: Action) -> tuple[bool, int]:
+                    """Avalia todos os itens contra a mesma captura XML."""
+                    queries = [str(query).strip() for query in (list_action.xml_list_queries or []) if str(query).strip()]
+                    if not current_xml or not queries:
+                        return False, 0
+                    matches = self._xml_logic_bounds_many(current_xml, queries)
+                    count = sum(bounds is not None for bounds in matches)
+                    required = len(queries) if list_action.xml_list_mode == "all" else max(1, int(list_action.xml_list_min_matches or 1))
+                    return count >= required, count
+
                 def run_branch(raw_actions: list[dict] | None, context: str = "Fluxo alternativo",
                                nav_rc_context: Action | None = None, tree_group_index: int | None = None,
-                               loop_restart_signal: list[bool] | None = None) -> bool:
+                               loop_restart_signal: list[bool | int | None] | None = None) -> bool:
                     """Executa a rota alternativa e então devolve ao fluxo principal."""
+                    branch_actions = list(raw_actions or [])
                     if nav_rc_context is not None:
-                        enabled_actions = [Action(**raw) for raw in (raw_actions or [])
-                                           if raw.get("enabled", True) and raw.get("kind") != "nav_rc_scroll"]
+                        # Ao executar Nav-R-C isoladamente (Shift+duplo
+                        # clique), a árvore ainda fornece objetos ``Action``.
+                        # No fluxo normal ela fornece dicionários já
+                        # serializados. Aceite os dois formatos: tratar o
+                        # objeto como ``**raw`` fazia a execução parar antes
+                        # de qualquer etapa do Nav-R-C.
+                        enabled_actions = [
+                            raw if isinstance(raw, Action) else Action(**raw)
+                            for raw in (raw_actions or [])
+                            if (raw.enabled if isinstance(raw, Action) else raw.get("enabled", True))
+                            and (raw.kind if isinstance(raw, Action) else raw.get("kind")) != "nav_rc_scroll"
+                        ]
                         if not enabled_actions or enabled_actions[0].kind != "xml_tap":
                             self.events.put(("status", "Nav-R-C: a primeira etapa precisa ser um toque XML; voltando ao Nav-R normal."))
                             return False
+                        # Macros antigas (ou montadas antes do assistente de
+                        # Nav-R-C) podem ter a etapa de digitação sem a de
+                        # extração. Garanta a dependência no instante da
+                        # execução: cada worker usa seu RuntimeVariables do
+                        # próprio serial, portanto não há compartilhamento
+                        # entre os celulares.
+                        has_extract = any(item.kind == "nav_rc_extract" for item in enabled_actions)
+                        first_type = next((index for index, item in enumerate(branch_actions)
+                                           if (item.kind if isinstance(item, Action) else item.get("kind")) == "nav_rc_type"), None)
+                        if first_type is not None and not has_extract:
+                            branch_actions.insert(first_type, Action(
+                                "nav_rc_extract", delay_ms=0,
+                                label="Extrair e validar comentário (automático)",
+                            ))
+                            self.events.put(("status", "Nav-R-C: inserindo a extração automática antes de digitar o comentário."))
+                        runtime_variables.remove("NAV_RC_TEXT")
                         if nav_rc_context.nav_rc_min_comments > 0:
                             count_xml = adb.try_ui_xml()
                             comment_count = self._nav_rc_comment_count(count_xml) if count_xml else None
@@ -13815,7 +17046,7 @@ class MacroApp(tk.Tk):
                             if comment_count < nav_rc_context.nav_rc_min_comments:
                                 self.events.put(("status", "Nav-R-C: quantidade abaixo do mínimo; voltando ao Nav-R normal."))
                                 return False
-                    for branch_index, raw in enumerate(raw_actions or [], 1):
+                    for branch_index, raw in enumerate(branch_actions, 1):
                         if self.run_stop_event.is_set(): return False
                         branch = raw if isinstance(raw, Action) else Action(**raw)
                         if not branch.enabled: continue
@@ -13830,11 +17061,16 @@ class MacroApp(tk.Tk):
                         label = branch.label or {"tap": "Toque", "swipe": "Arrasto", "key": "Tecla", "training_random_username": "Usuário aleatório treino", "random_wait": "Espera aleatória"}.get(branch.kind, branch.kind)
                         # O andamento da etapa aparece diretamente na árvore.
                         branch_delay_down_ms, branch_delay_up_ms = self._delay_variation_offsets(branch)
+                        # ``_delay_variation_offsets`` já devolve limites em
+                        # milissegundos.  Sortear entre eles é suficiente; ao
+                        # multiplicar novamente por ``delay_ms`` uma pausa de
+                        # 400 ms virava ~128 segundos dentro de subgrupos.
                         branch_delay = max(
                             minimum_delay,
-                            max(0, branch.delay_ms * random.uniform(
-                            max(0, branch.delay_ms - branch_delay_down_ms), branch.delay_ms + branch_delay_up_ms,
-                            )),
+                            random.uniform(
+                                max(0, branch.delay_ms - branch_delay_down_ms),
+                                branch.delay_ms + branch_delay_up_ms,
+                            ),
                         )
                         if self.run_stop_event.wait(branch_delay / 1000): return False
                         branch_start_variation = max(0, branch.position_variation_px or 0) if branch.use_variation else 0
@@ -13897,6 +17133,25 @@ class MacroApp(tk.Tk):
                                     self.run_stop_event.wait(XML_RETRY_INTERVAL_S)
                                 if not found:
                                     break
+                            continue
+                        if branch.kind == "xml_list":
+                            deadline = time.monotonic() + max(0.1, float(branch.timeout_s))
+                            valid = False
+                            matched_count = 0
+                            while time.monotonic() < deadline and not self.run_stop_event.is_set():
+                                current_xml = adb.try_ui_xml()
+                                valid, matched_count = xml_list_is_valid(current_xml, branch)
+                                if valid:
+                                    break
+                                self.run_stop_event.wait(XML_RETRY_INTERVAL_S)
+                            if valid:
+                                self.events.put(("status", f"{context}: Lista de XMLs validou {matched_count} item(ns); executando grupo."))
+                                if not run_branch(branch.branch_actions, f"{context} > {branch.label or 'Lista de XMLs'}",
+                                                  tree_group_index=tree_group_index,
+                                                  loop_restart_signal=loop_restart_signal):
+                                    return False
+                            else:
+                                self.events.put(("status", f"{context}: Lista de XMLs não atingiu o critério; grupo ignorado."))
                             continue
                         if branch.kind == "navigate_r":
                             configured = [item if isinstance(item, Action) else Action(**item)
@@ -13974,6 +17229,7 @@ class MacroApp(tk.Tk):
                             end_at = time.monotonic() + random.uniform(branch.nav_min_s, branch.nav_max_s)
                             cycle = 0
                             missing_attempts = 0
+                            unavailable_cycles = 0
                             while time.monotonic() < end_at and not self.run_stop_event.is_set():
                                 cycle += 1
                             # A verificação é silenciosa; o resultado encontrado é registrado abaixo.
@@ -14020,6 +17276,7 @@ class MacroApp(tk.Tk):
                                 if continue_normal or self.run_stop_event.is_set():
                                     break
                                 if xml_unavailable:
+                                    unavailable_cycles += 1
                                     variation = max(0, branch.nav_position_variation_px)
                                     sx = max(0, min(target_screen[0] - 1, recorded_swipe.x + random.randint(-variation, variation)))
                                     sy = max(0, min(target_screen[1] - 1, recorded_swipe.y + random.randint(-variation, variation)))
@@ -14027,10 +17284,32 @@ class MacroApp(tk.Tk):
                                     ey = max(0, min(target_screen[1] - 1, (recorded_swipe.y2 if recorded_swipe.y2 is not None else recorded_swipe.y) + random.randint(-variation, variation)))
                                     self.events.put(("status", f"{context}: Nav-S, XML indisponível após 3 tentativas; executando somente o arrasto."))
                                     adb.command("shell", "input", "swipe", str(sx), str(sy), str(ex), str(ey), str(max(1, recorded_swipe.duration_ms)))
+                                    fallback = next((item for item in configured if item.kind == "xml_list" and item.enabled), None)
+                                    if unavailable_cycles >= 2 and fallback is not None:
+                                        self.events.put(("status", f"{context}: Nav-S continua sem XML após o arrasto; executando a rota da Lista de XMLs e encerrando Nav-S."))
+                                        if not run_branch(fallback.branch_actions, f"{context} > {fallback.label or 'Lista de XMLs'}",
+                                                          tree_group_index=tree_group_index,
+                                                          loop_restart_signal=loop_restart_signal):
+                                            return False
+                                        break
                                     continue
+                                unavailable_cycles = 0
                                 if not found_action:
                                     missing_attempts += 1
                                     if missing_attempts >= 3:
+                                        fallback = next((item for item in configured if item.kind == "xml_list" and item.enabled), None)
+                                        if fallback is not None:
+                                            current_xml = adb.try_ui_xml()
+                                            valid, matched_count = xml_list_is_valid(current_xml, fallback)
+                                            if valid:
+                                                self.events.put(("status", f"{context}: Nav-S sem validações normais; Lista de XMLs validou {matched_count} item(ns). Executando grupo e encerrando Nav-S."))
+                                                if not run_branch(fallback.branch_actions, f"{context} > {fallback.label or 'Lista de XMLs'}",
+                                                                  tree_group_index=tree_group_index,
+                                                                  loop_restart_signal=loop_restart_signal):
+                                                    return False
+                                                found_action = True
+                                                break
+                                            self.events.put(("status", f"{context}: Lista de XMLs não atingiu o critério."))
                                         self.events.put(("status", f"{context}: Nav-S, nenhum XML encontrado após 3 tentativas; seguindo o fluxo normal."))
                                         break
                                 remaining = end_at - time.monotonic()
@@ -14072,9 +17351,18 @@ class MacroApp(tk.Tk):
                                     break
                                 self.run_stop_event.wait(XML_RETRY_INTERVAL_S)
                             if found:
-                                if loop_restart_signal is not None:
+                                controller_group = (
+                                    loop_restart_signal[1]
+                                    if loop_restart_signal is not None and len(loop_restart_signal) > 1
+                                    else None
+                                )
+                                if (loop_restart_signal is not None
+                                        and (branch.loop_restart_group is None
+                                             or branch.loop_restart_group == controller_group)):
                                     loop_restart_signal[0] = True
-                                self.events.put(("status", f"{context}: XML encontrou ‘{branch.selector_value}’; reiniciando o ciclo."))
+                                    self.events.put(("status", f"{context}: XML encontrou ‘{branch.selector_value}’; reiniciando o Loop XML configurado."))
+                                else:
+                                    self.events.put(("status", f"{context}: XML encontrou ‘{branch.selector_value}’, mas esta etapa não pertence ao Loop XML em execução; nenhum grupo-pai será reiniciado."))
                                 return True
                             self.events.put(("status", f"{context}: XML não encontrou ‘{branch.selector_value}’; seguindo o ciclo."))
                         elif branch.kind == "tap":
@@ -14084,16 +17372,34 @@ class MacroApp(tk.Tk):
                         elif branch.kind == "key":
                             adb.command("shell", "input", "keyevent", branch.keycode or "KEYCODE_BACK")
                         elif branch.kind == "xml_tap":
-                            current_xml, xml_unavailable = regular_xml(branch, context)
-                            position = self._xml_bounds(current_xml, branch) if current_xml else None
+                            # XMLs dentro de subgrupos percorriam este caminho
+                            # e antes recebiam apenas uma captura. Isso fazia a
+                            # próxima etapa iniciar imediatamente quando o
+                            # elemento ainda não tinha aparecido. Use o mesmo
+                            # prazo das etapas XML de raiz.
+                            position = None
+                            xml_unavailable = False
+                            end_at = time.monotonic() + max(0.1, float(branch.timeout_s))
+                            while time.monotonic() < end_at and not self.run_stop_event.is_set():
+                                current_xml, xml_unavailable = regular_xml(branch, context)
+                                if xml_unavailable:
+                                    break
+                                position = self._xml_bounds(current_xml, branch) if current_xml else None
+                                if position:
+                                    break
+                                self.run_stop_event.wait(min(XML_RETRY_INTERVAL_S, max(0, end_at - time.monotonic())))
                             if position:
                                 mark_live_xml(current_xml, branch)
                                 tap_x = max(0, min(target_screen[0] - 1, position[0] + branch_dx))
                                 tap_y = max(0, min(target_screen[1] - 1, position[1] + branch_dy))
+                                if self._wait_before_xml_tap(branch, self.run_stop_event):
+                                    return False
                                 adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
                             elif nav_rc_context is not None and not xml_unavailable:
                                 self.events.put(("status", "Nav-R-C: toque XML não encontrado; voltando ao Nav-R normal."))
                                 return False
+                            elif not self.run_stop_event.is_set() and not xml_unavailable:
+                                self.events.put(("status", f"{context}: XML não encontrou ‘{branch.selector_value}’ após {branch.timeout_s:g} s; seguindo a próxima etapa."))
                         elif branch.kind == "xml_logic":
                             end_at = time.monotonic() + max(1, branch.timeout_s)
                             found = False
@@ -14119,8 +17425,15 @@ class MacroApp(tk.Tk):
                             else:
                                 self.events.put(("status", f"{context}: XML não encontrou ‘{branch.selector_value}’; subgrupo ignorado."))
                         elif branch.kind == "nav_rc_extract":
-                            scroll_entry = next(((index, Action(**item)) for index, item in enumerate(raw_actions or [])
-                                                 if item.get("enabled", True) and item.get("kind") == "nav_rc_scroll"), None)
+                            scroll_entry = next(
+                                (
+                                    (index, item if isinstance(item, Action) else Action(**item))
+                                    for index, item in enumerate(branch_actions)
+                                    if (item.enabled if isinstance(item, Action) else item.get("enabled", True))
+                                    and (item.kind if isinstance(item, Action) else item.get("kind")) == "nav_rc_scroll"
+                                ),
+                                None,
+                            )
                             extracted = None
                             attempts = max(0, nav_rc_context.nav_rc_max_scrolls) if nav_rc_context else 0
                             performed_scrolls = 0
@@ -14177,7 +17490,14 @@ class MacroApp(tk.Tk):
                             runtime_variables.set("NAV_RC_TEXT", extracted_text)
                             self.events.put(("status", f"Nav-R-C: texto válido extraído ({extracted_date}): {extracted_text}"))
                         elif branch.kind == "nav_rc_type":
-                            extracted_text = str(runtime_variables.require("NAV_RC_TEXT")).strip()
+                            extracted_text = ensure_nav_rc_text(nav_rc_context)
+                            if not extracted_text:
+                                # A extração não encontrou um comentário
+                                # válido neste telefone. Não trate isso como
+                                # falha global nem deixe uma caixa de erro
+                                # interromper os demais celulares.
+                                self.events.put(("status", "Nav-R-C: nenhum comentário válido foi extraído; digitação ignorada."))
+                                return False
                             options = [str(value).strip() for value in (branch.text_options or []) if str(value).strip()]
                             complement = random.choice(options) if options else ""
                             text_to_type = " ".join(part for part in (extracted_text, complement) if part)
@@ -14231,7 +17551,7 @@ class MacroApp(tk.Tk):
                                 except Exception as error:
                                     save_whisper_error(error)
                                     if not whisper_capture_stop.is_set() and not self.run_stop_event.is_set():
-                                        self.events.put(("status", f"{capture_context}: falha ao capturar pelo Whisper: {error}"))
+                                        self.events.put(("status", f"{capture_context}: Whisper não conseguiu identificar o código."))
                                 finally:
                                     whisper_capture_pending.clear()
 
@@ -14239,8 +17559,11 @@ class MacroApp(tk.Tk):
                         elif branch.kind == "whisper_type":
                             self.events.put(("status", f"{context}: aguardando código Whisper antes de seguir."))
                             code = wait_for_whisper_code()
-                            self._type_verification_code(adb, code)
-                            self.events.put(("status", f"{context}: código Whisper digitado."))
+                            if code:
+                                self._type_verification_code(adb, code)
+                                self.events.put(("status", f"{context}: código Whisper digitado."))
+                            else:
+                                self.events.put(("status", f"{context}: digitação Whisper ignorada; siga para a sua próxima tentativa."))
                             continue
                             def type_branch_whisper(serial=adb.serial or target["serial"], type_context=context):
                                 while whisper_capture_pending.is_set() and not self.run_stop_event.wait(0.2):
@@ -14298,6 +17621,9 @@ class MacroApp(tk.Tk):
                             if not branch_identity:
                                 raise RuntimeError("Este telefone não possui uma identidade vinculada.")
                             adb.command("shell", "input", "text", str(branch_identity["email"]))
+                        elif branch.kind == "browser_invite":
+                            self._send_browser_invite(self._current_invite_username(runtime_variables, adb.serial),
+                                                      branch.browser_actions, branch.browser_url)
                         elif branch.kind in ("generated_password", "generated_full_name", "generated_username"):
                             branch_identity = linked_identity() or latest_identity_for_device(adb.serial)
                             if not branch_identity:
@@ -14322,30 +17648,16 @@ class MacroApp(tk.Tk):
                             runtime_variables.set("CURRENT_EMAIL", branch_identity["email"])
                             runtime_variables.set("CURRENT_PASSWORD", branch_identity["senha"])
                             runtime_variables.remove("CURRENT_USERNAME")
-                            character = self._bind_random_character(runtime_variables, replace_current=True)
-                            links = [str(link).strip() for link in (character or {}).get("links", []) if str(link).strip()]
-                            if not links:
-                                links = [str(link).strip() for link in profile.get("links", []) if str(link).strip()]
-                            if not links and str(profile.get("link", "")).strip():
-                                links = [str(profile["link"]).strip()]
-                            runtime_variables.set("RANDOM_USER_LINKS", links)
-                            runtime_variables.set("RANDOM_USER_LINK", random.choice(links) if links else "")
-                            runtime_variables.set("RANDOM_USER_FILES", profile["arquivos"])
-                            runtime_variables.set("RANDOM_USER_FILES_TO_SEND", profile.get("arquivos_para_enviar", profile["arquivos"]))
-                            runtime_variables.remove("RANDOM_USER_SENT_FILES", "LINK_TITLE")
+                            media_folder = self._assign_identity_media_folder(runtime_variables)
+                            runtime_variables.remove("RANDOM_USER_LINKS", "RANDOM_USER_LINK", "RANDOM_USER_FILES", "RANDOM_USER_FILES_TO_SEND", "RANDOM_USER_SENT_FILES", "LINK_TITLE")
                             runtime_variables.set("IDENTITY_UNLINKED", False)
+                            self.events.put(("log", f"Identidade: pasta temporária {media_folder.name} atribuída ao telefone {target_no}."))
                         elif branch.kind == "random_name":
                             profile = random_name_profile()
                             name = str(profile["nome"])
                             runtime_variables.set("CURRENT_NAME", name)
                             runtime_variables.set("RANDOM_NAME", name)
-                            character = self._bind_random_character(runtime_variables)
-                            links = [str(link).strip() for link in (character or {}).get("links", []) if str(link).strip()]
-                            if not links:
-                                links = [str(link).strip() for link in profile.get("links", []) if str(link).strip()]
-                            runtime_variables.set("RANDOM_USER_LINKS", links)
-                            runtime_variables.set("RANDOM_USER_LINK", random.choice(links) if links else "")
-                            runtime_variables.set("RANDOM_USER_FILES", profile["arquivos"])
+                            runtime_variables.remove("RANDOM_USER_LINKS", "RANDOM_USER_LINK", "RANDOM_USER_FILES")
                             plain_name = "".join(char for char in unicodedata.normalize("NFKD", name)
                                                  if not unicodedata.combining(char))
                             adb.command("shell", "input", "text", plain_name)
@@ -14356,9 +17668,14 @@ class MacroApp(tk.Tk):
                                 raise RuntimeError("Este telefone não possui nome e sobrenome vinculados.")
                             self._add_to_waiting_identities(first_name, last_name, adb.serial or target["serial"])
                         elif branch.kind == "random_user_files":
-                            sources = ([self._random_media_from_character(runtime_variables, branch.character_media_folder)[0]]
-                                       if branch.character_media_folder is not None else
-                                       [Path(str(value)).expanduser() for value in (branch.file_paths or [])])
+                            if branch.identity_media_type:
+                                source, identity_folder_name = self._random_media_from_identity(runtime_variables, branch.identity_media_type)
+                                sources = [source]
+                                self.events.put(("log", f"Identidade {identity_folder_name}: {branch.identity_media_type} sorteada ({source.name})."))
+                            else:
+                                sources = ([self._random_media_from_character(runtime_variables, branch.character_media_folder)[0]]
+                                           if branch.character_media_folder is not None else
+                                           [Path(str(value)).expanduser() for value in (branch.file_paths or [])])
                             if not sources:
                                 raise RuntimeError("Esta etapa não possui arquivos selecionados para enviar.")
                             if any(not source.is_file() for source in sources):
@@ -14398,13 +17715,13 @@ class MacroApp(tk.Tk):
                         elif branch.kind == "random_user_link":
                             account = self._load_fixed_accounts().get(adb.serial or target["serial"], {})
                             link = str(account.get("link", "")).strip()
+                            if account and not link:
+                                raise RuntimeError("Esta Conta Normal não possui link cadastrado. Configure-o em Conta normal.")
                             if not link:
-                                options = runtime_variables.get("RANDOM_USER_LINKS", [])
-                                options = [str(value).strip() for value in options if str(value).strip()] if isinstance(options, list) else []
-                                link = random.choice(options) if options else str(runtime_variables.get("RANDOM_USER_LINK", "")).strip()
+                                links = load_identity_links()
+                                link = random.choice(links) if links else ""
                             if not link:
-                                raise RuntimeError("Este telefone não possui link cadastrado.")
-                            runtime_variables.set("RANDOM_USER_LINK", link)
+                                raise RuntimeError("Cadastre ao menos um link geral em Gerenciar identidades.")
                             self._type_link_title(adb, link)
                         elif branch.kind == "random_link_title":
                             title = random_link_title(LINK_TITLES_FILE)
@@ -14547,7 +17864,7 @@ class MacroApp(tk.Tk):
                                 except Exception as error:
                                     save_whisper_error(error)
                                     if not whisper_capture_stop.is_set() and not self.run_stop_event.is_set():
-                                        self.events.put(("status", f"{branch_label}: falha ao capturar áudio: {error}"))
+                                        self.events.put(("status", f"{branch_label}: Whisper não conseguiu identificar o código."))
                                 finally:
                                     whisper_capture_pending.clear()
 
@@ -14556,8 +17873,11 @@ class MacroApp(tk.Tk):
                         elif branch.kind == "whisper_type":
                             self.events.put(("status", f"{context}: aguardando código Whisper antes de seguir."))
                             code = wait_for_whisper_code()
-                            self._type_verification_code(adb, code)
-                            self.events.put(("status", f"{context}: código Whisper digitado."))
+                            if code:
+                                self._type_verification_code(adb, code)
+                                self.events.put(("status", f"{context}: código Whisper digitado."))
+                            else:
+                                self.events.put(("status", f"{context}: digitação Whisper ignorada; siga para a sua próxima tentativa."))
                             continue
                             def type_branch_whisper_when_ready(serial=adb.serial or target["serial"],
                                                                branch_label=branch.label or "Whisper"):
@@ -14602,7 +17922,12 @@ class MacroApp(tk.Tk):
                             candidates = [item for item in branch_candidates if item.enabled and item.kind == "xml_tap"]
                             max_rounds = max(1, int(branch.xml_any_max_rounds or 1))
                             completed_rounds = 0
-                            missing_attempts = 0
+                            # Antes o grupo abandonava a procura depois de só
+                            # três dumps. Com o uiautomator2 isso podia ocorrer
+                            # em menos de 3 s e dava a impressão de que etapas
+                            # XML tinham sido puladas. Cada rodada procura pelo
+                            # primeiro XML por até o mesmo limite global: 10 s.
+                            search_deadline = time.monotonic() + max(0.1, float(branch.timeout_s))
                             while completed_rounds < max_rounds and not self.run_stop_event.is_set():
                                 current_xml = adb.try_ui_xml()
                                 if special_candidate and current_xml:
@@ -14625,7 +17950,7 @@ class MacroApp(tk.Tk):
                                         if loop_restart_signal and loop_restart_signal[0]:
                                             break
                                         completed_rounds += 1
-                                        missing_attempts = 0
+                                        search_deadline = time.monotonic() + max(0.1, float(branch.timeout_s))
                                         retry_wait = random.uniform(
                                             max(0, XML_RETRY_INTERVAL_S * 1000 - branch_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + branch_delay_up_ms,
                                         ) / 1000
@@ -14644,14 +17969,12 @@ class MacroApp(tk.Tk):
                                             selected = (item, position)
                                             break
                                 if not selected:
-                                    missing_attempts += 1
-                                    if missing_attempts >= 3:
-                                        self.events.put(("status", f"{context}: nenhum XML da etapa ‘{branch.label or 'clicar qualquer'}’ foi encontrado após 3 tentativas; seguindo o fluxo."))
+                                    if time.monotonic() >= search_deadline:
+                                        self.events.put(("status", f"{context}: nenhum XML da etapa ‘{branch.label or 'clicar qualquer'}’ foi encontrado após 10 s; seguindo o fluxo."))
                                         break
                                     retry_wait = random.uniform(
                                         max(0, XML_RETRY_INTERVAL_S * 1000 - branch_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + branch_delay_up_ms,
                                     ) / 1000
-                                    self.events.put(("status", f"{context}: nenhum XML encontrado; nova tentativa {missing_attempts + 1}/3."))
                                     if self.run_stop_event.wait(max(0, retry_wait)):
                                         break
                                     continue
@@ -14659,9 +17982,11 @@ class MacroApp(tk.Tk):
                                 mark_live_xml(current_xml, selected_action)
                                 tap_x = max(0, min(target_screen[0] - 1, position[0] + random.randint(-branch_start_variation, branch_start_variation)))
                                 tap_y = max(0, min(target_screen[1] - 1, position[1] + random.randint(-branch_start_variation, branch_start_variation)))
+                                if self._wait_before_xml_tap(selected_action, self.run_stop_event):
+                                    break
                                 adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
                                 completed_rounds += 1
-                                missing_attempts = 0
+                                search_deadline = time.monotonic() + max(0.1, float(branch.timeout_s))
                                 retry_wait = random.uniform(
                                     max(0, XML_RETRY_INTERVAL_S * 1000 - branch_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + branch_delay_up_ms,
                                 ) / 1000
@@ -14884,6 +18209,10 @@ class MacroApp(tk.Tk):
                             raise RuntimeError("Este telefone não possui uma identidade vinculada. Execute antes a etapa Nova identidade.")
                         adb.command("shell", "input", "text", identity["email"])
                         self.events.put(("status", f"E-mail digitado no telefone {target_no}."))
+                    elif action.kind == "browser_invite":
+                        username = self._current_invite_username(runtime_variables, adb.serial)
+                        self._send_browser_invite(username, action.browser_actions, action.browser_url)
+                        self.events.put(("status", f"Convite enviado para @{username} pelo navegador isolado."))
                     elif action.kind == "generated_password":
                         if not identity:
                             if runtime_variables.get("IDENTITY_UNLINKED", False):
@@ -14904,15 +18233,7 @@ class MacroApp(tk.Tk):
                         typed_name = "".join(char for char in unicodedata.normalize("NFKD", name) if not unicodedata.combining(char))
                         runtime_variables.set("CURRENT_NAME", name)
                         runtime_variables.set("RANDOM_NAME", name)
-                        character = self._bind_random_character(runtime_variables)
-                        user_links = [str(link).strip() for link in (character or {}).get("links", []) if str(link).strip()]
-                        if not user_links:
-                            user_links = [str(link).strip() for link in user.get("links", []) if str(link).strip()]
-                        if not user_links and str(user.get("link", "")).strip():
-                            user_links = [str(user["link"]).strip()]
-                        runtime_variables.set("RANDOM_USER_LINKS", user_links)
-                        runtime_variables.set("RANDOM_USER_LINK", random.choice(user_links) if user_links else "")
-                        runtime_variables.set("RANDOM_USER_FILES", user["arquivos"])
+                        runtime_variables.remove("RANDOM_USER_LINKS", "RANDOM_USER_LINK", "RANDOM_USER_FILES")
                         adb.command("shell", "input", "text", typed_name)
                         self.events.put(("status", f"Nome aleatório digitado no telefone {target_no}."))
                     elif action.kind == "unlink_identity":
@@ -14924,19 +18245,10 @@ class MacroApp(tk.Tk):
                         runtime_variables.set("CURRENT_EMAIL", identity["email"])
                         runtime_variables.set("CURRENT_PASSWORD", identity["senha"])
                         runtime_variables.remove("CURRENT_USERNAME")
-                        character = self._bind_random_character(runtime_variables, replace_current=True)
-                        profile_links = [str(link).strip() for link in (character or {}).get("links", []) if str(link).strip()]
-                        if not profile_links:
-                            profile_links = [str(link).strip() for link in profile.get("links", []) if str(link).strip()]
-                        if not profile_links and str(profile.get("link", "")).strip():
-                            profile_links = [str(profile["link"]).strip()]
-                        runtime_variables.set("RANDOM_USER_LINKS", profile_links)
-                        runtime_variables.set("RANDOM_USER_LINK", random.choice(profile_links) if profile_links else "")
-                        runtime_variables.set("RANDOM_USER_FILES", profile["arquivos"])
-                        runtime_variables.set("RANDOM_USER_FILES_TO_SEND", profile.get("arquivos_para_enviar", profile["arquivos"]))
-                        runtime_variables.remove("RANDOM_USER_SENT_FILES", "LINK_TITLE")
+                        media_folder = self._assign_identity_media_folder(runtime_variables)
+                        runtime_variables.remove("RANDOM_USER_LINKS", "RANDOM_USER_LINK", "RANDOM_USER_FILES", "RANDOM_USER_FILES_TO_SEND", "RANDOM_USER_SENT_FILES", "LINK_TITLE")
                         runtime_variables.set("IDENTITY_UNLINKED", False)
-                        self.events.put(("status", f"Nova identidade {identity['nome']} {identity['sobrenome']} vinculada ao telefone {target_no}."))
+                        self.events.put(("status", f"Nova identidade {identity['nome']} {identity['sobrenome']} vinculada ao telefone {target_no}; pasta temporária {media_folder.name}."))
                     elif action.kind == "add_waiting_identity":
                         first_name = str(runtime_variables.get("CURRENT_NAME", "")).strip()
                         last_name = str(runtime_variables.get("CURRENT_LAST_NAME", "")).strip()
@@ -14954,9 +18266,14 @@ class MacroApp(tk.Tk):
                         adb.command("shell", "input", "text", username)
                         self.events.put(("status", f"Usuário aleatório de treino digitado no telefone {target_no}."))
                     elif action.kind == "random_user_files":
-                        sources = ([self._random_media_from_character(runtime_variables, action.character_media_folder)[0]]
-                                   if action.character_media_folder is not None else
-                                   [Path(str(file_path)).expanduser() for file_path in (action.file_paths or [])])
+                        if action.identity_media_type:
+                            source, identity_folder_name = self._random_media_from_identity(runtime_variables, action.identity_media_type)
+                            sources = [source]
+                            self.events.put(("log", f"Identidade {identity_folder_name}: {action.identity_media_type} sorteada ({source.name})."))
+                        else:
+                            sources = ([self._random_media_from_character(runtime_variables, action.character_media_folder)[0]]
+                                       if action.character_media_folder is not None else
+                                       [Path(str(file_path)).expanduser() for file_path in (action.file_paths or [])])
                         if not sources:
                             raise RuntimeError("Esta etapa não possui uma pasta de personagem nem arquivos selecionados para enviar.")
                         for source in sources:
@@ -15005,32 +18322,20 @@ class MacroApp(tk.Tk):
                         adb.command("shell", "rm", "-rf", "/sdcard/Pictures/IG_Jam", timeout=60)
                         self.events.put(("status", f"Imagens enviadas pelo iggen limpas no telefone {target_no}."))
                     elif action.kind == "random_user_link":
-                        # Uma Conta Normal possui seu próprio link e não depende
-                        # da identidade aleatória vinculada ao telefone.
+                        # Conta Normal mantém seu link próprio; identidades usam
+                        # a lista geral e sorteiam um item a cada etapa.
                         normal_account = self._load_fixed_accounts().get(adb.serial or target["serial"], {})
                         link = str(normal_account.get("link", "")).strip()
                         if normal_account and not link:
                             raise RuntimeError("Esta Conta Normal não possui link cadastrado. Configure-o em Conta normal.")
-                        link_source = "Conta Normal" if normal_account else "nome"
                         if not link:
-                            saved_links = runtime_variables.get("RANDOM_USER_LINKS", [])
-                            links = [str(item).strip() for item in saved_links if str(item).strip()] if isinstance(saved_links, list) else []
-                            link = random.choice(links) if links else str(runtime_variables.get("RANDOM_USER_LINK", "")).strip()
+                            links = load_identity_links()
+                            link = random.choice(links) if links else ""
                         if not link:
-                            current_name = str(runtime_variables.get("CURRENT_NAME", "")).strip()
-                            profile = next((item for item in load_name_profiles()
-                                            if str(item.get("nome", "")).casefold() == current_name.casefold()), None)
-                            profile_links = [str(item).strip() for item in (profile or {}).get("links", []) if str(item).strip()]
-                            if not profile_links and profile and str(profile.get("link", "")).strip():
-                                profile_links = [str(profile["link"]).strip()]
-                            link = random.choice(profile_links) if profile_links else ""
-                            if not link:
-                                raise RuntimeError("Este telefone não possui link cadastrado nem na Conta Normal nem no nome atual.")
-                            runtime_variables.set("RANDOM_USER_LINKS", profile_links)
-                            runtime_variables.set("RANDOM_USER_LINK", link)
-                        runtime_variables.set("RANDOM_USER_LINK", link)
+                            raise RuntimeError("Cadastre ao menos um link geral em Gerenciar identidades.")
                         adb.command("shell", "input", "text", link.replace(" ", "%s"))
-                        self.events.put(("status", f"Link da {link_source} digitado no telefone {target_no}."))
+                        origin = "Conta Normal" if normal_account else "lista geral"
+                        self.events.put(("status", f"Link da {origin} digitado no telefone {target_no}."))
                     elif action.kind == "random_link_title":
                         title = random_link_title(LINK_TITLES_FILE)
                         runtime_variables.set("LINK_TITLE", title)
@@ -15067,6 +18372,15 @@ class MacroApp(tk.Tk):
                         adb.command("shell", "input", "keyevent", "KEYCODE_ENTER")
                     elif action.kind == "type_text":
                         self._type_link_title(adb, action.text_value or "")
+                    elif action.kind == "nav_rc_type":
+                        extracted_text = ensure_nav_rc_text()
+                        if not extracted_text:
+                            continue
+                        options = [str(value).strip() for value in (action.text_options or []) if str(value).strip()]
+                        complement = random.choice(options) if options else ""
+                        self._type_link_title(adb, " ".join(part for part in (extracted_text, complement) if part))
+                        if complement:
+                            self.events.put(("status", "Nav-R-C: comentário extraído digitado com complemento aleatório."))
                     elif action.kind == "random_text":
                         text = random_text(RANDOM_TEXTS_FILE)
                         runtime_variables.set("RANDOM_TEXT", text)
@@ -15272,7 +18586,7 @@ class MacroApp(tk.Tk):
                             except Exception as error:
                                 save_whisper_error(error)
                                 if not whisper_capture_stop.is_set() and not self.run_stop_event.is_set():
-                                    self.events.put(("status", f"Falha ao capturar pelo Whisper no telefone {target_no}: {error}"))
+                                    self.events.put(("status", f"Whisper não conseguiu identificar o código no telefone {target_no}."))
                             finally:
                                 whisper_capture_pending.clear()
 
@@ -15283,8 +18597,11 @@ class MacroApp(tk.Tk):
                         # resultado ficar pronto.
                         self.events.put(("status", f"Aguardando código Whisper no telefone {target_no}…"))
                         code = wait_for_whisper_code()
-                        self._type_verification_code(adb, code)
-                        self.events.put(("status", f"Código Whisper digitado no telefone {target_no}."))
+                        if code:
+                            self._type_verification_code(adb, code)
+                            self.events.put(("status", f"Código Whisper digitado no telefone {target_no}."))
+                        else:
+                            self.events.put(("status", f"Código Whisper indisponível no telefone {target_no}; seguindo o fluxo para a próxima tentativa."))
                         continue
                         if whisper_capture_pending.is_set():
                             # Não bloqueia a macro: quando a escuta terminar,
@@ -15335,7 +18652,10 @@ class MacroApp(tk.Tk):
                             # isso evita multiplicar a demora da leitura XML.
                             max_rounds = max(1, int(action.xml_any_max_rounds or 1))
                             completed_rounds = 0
-                            missing_attempts = 0
+                            # Uma rodada de “clicar qualquer XML” deve ter a
+                            # mesma chance das etapas XML comuns. Três dumps
+                            # eram insuficientes e pulavam a rodada cedo.
+                            search_deadline = time.monotonic() + max(0.1, float(action.timeout_s))
                             while completed_rounds < max_rounds and not self.run_stop_event.is_set():
                                 attempt = completed_rounds
                                 current_xml = adb.try_ui_xml()
@@ -15357,7 +18677,7 @@ class MacroApp(tk.Tk):
                                     if not route_completed and not self.run_stop_event.is_set():
                                         self.events.put(("status", f"{action.label or 'XML clicar'}: rota especial terminou antes do fim; continuando as verificaÃ§Ãµes XML."))
                                     completed_rounds += 1
-                                    missing_attempts = 0
+                                    search_deadline = time.monotonic() + max(0.1, float(action.timeout_s))
                                     retry_wait = random.uniform(max(0, XML_RETRY_INTERVAL_S * 1000 - action_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + action_delay_up_ms) / 1000
                                     if completed_rounds < max_rounds and self.run_stop_event.wait(max(0, retry_wait)):
                                         break
@@ -15372,24 +18692,24 @@ class MacroApp(tk.Tk):
                                     mark_live_xml(current_xml, found_action)
                                     tap_x = max(0, min(target_screen[0] - 1, found_position[0] + random.randint(-action_pos_v, action_pos_v)))
                                     tap_y = max(0, min(target_screen[1] - 1, found_position[1] + random.randint(-action_pos_v, action_pos_v)))
+                                    if self._wait_before_xml_tap(found_action, self.run_stop_event):
+                                        break
                                     adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
                                     self.events.put(("status", f"{action.label or 'XML clicar'}: encontrou {found_action.selector_value!r} e tocou ({attempt + 1}/{max_rounds})."))
                                     found_action = None
                                     found_position = None
                                     completed_rounds += 1
-                                    missing_attempts = 0
+                                    search_deadline = time.monotonic() + max(0.1, float(action.timeout_s))
                                     retry_wait = random.uniform(max(0, XML_RETRY_INTERVAL_S * 1000 - action_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + action_delay_up_ms) / 1000
                                     if completed_rounds < max_rounds and self.run_stop_event.wait(max(0, retry_wait)):
                                         break
                                     continue
                                 if self.run_stop_event.is_set():
                                     break
-                                missing_attempts += 1
-                                if missing_attempts >= 3:
-                                    self.events.put(("status", f"{action.label or 'XML clicar'}: nenhum dos {len(candidates)} XMLs foi encontrado após 3 tentativas; seguindo o fluxo."))
+                                if time.monotonic() >= search_deadline:
+                                    self.events.put(("status", f"{action.label or 'XML clicar'}: nenhum dos {len(candidates)} XMLs foi encontrado após 10 s; seguindo o fluxo."))
                                     break
                                 retry_wait = random.uniform(max(0, XML_RETRY_INTERVAL_S * 1000 - action_delay_down_ms), XML_RETRY_INTERVAL_S * 1000 + action_delay_up_ms) / 1000
-                                self.events.put(("status", f"{action.label or 'XML clicar'}: nenhum XML encontrado; nova tentativa {missing_attempts + 1}/3."))
                                 if self.run_stop_event.wait(max(0, retry_wait)):
                                     break
                     elif action.kind == "xml_group_gate":
@@ -15399,7 +18719,6 @@ class MacroApp(tk.Tk):
                             current_xml = adb.try_ui_xml()
                             found = bool(current_xml) and self._xml_logic_bounds(current_xml, action.selector_value or "", action.selector_blocked_text or "") is not None
                             if found:
-                                mark_live_xml(current_xml, action)
                                 break
                             self.run_stop_event.wait(XML_RETRY_INTERVAL_S)
                         if found:
@@ -15424,9 +18743,26 @@ class MacroApp(tk.Tk):
                         if position:
                             tap_x = max(0, min(target_screen[0] - 1, position[0] + random.randint(-action_pos_v, action_pos_v)))
                             tap_y = max(0, min(target_screen[1] - 1, position[1] + random.randint(-action_pos_v, action_pos_v)))
+                            if self._wait_before_xml_tap(action, self.run_stop_event):
+                                break
                             adb.command("shell", "input", "tap", str(tap_x), str(tap_y))
                         elif not self.run_stop_event.is_set() and not xml_unavailable:
                             self.events.put(("status", f"XML não encontrou ‘{action.selector_value}’; etapa ignorada."))
+                    elif action.kind == "xml_list":
+                        deadline = time.monotonic() + max(0.1, float(action.timeout_s))
+                        valid = False
+                        matched_count = 0
+                        while time.monotonic() < deadline and not self.run_stop_event.is_set():
+                            current_xml = adb.try_ui_xml()
+                            valid, matched_count = xml_list_is_valid(current_xml, action)
+                            if valid:
+                                break
+                            self.run_stop_event.wait(XML_RETRY_INTERVAL_S)
+                        if valid:
+                            self.events.put(("status", f"{action.label or 'Lista de XMLs'}: {matched_count} XML(s) validado(s); executando grupo."))
+                            run_branch(action.branch_actions, action.label or "Lista de XMLs", tree_group_index=action.flow_group)
+                        elif not self.run_stop_event.is_set():
+                            self.events.put(("status", f"{action.label or 'Lista de XMLs'}: critério não atingido; grupo ignorado."))
                     elif action.kind == "xml_logic":
                         end_at = time.monotonic() + action.timeout_s
                         found = False
@@ -15496,7 +18832,9 @@ class MacroApp(tk.Tk):
                         cycle_actions = action.branch_actions
                         full_cycle_actions = action.loop_restart_actions or action.branch_actions
                         while completed_rounds < rounds and not self.run_stop_event.is_set():
-                            restart_signal = [False]
+                            # O segundo item identifica o único grupo que pode
+                            # responder a "XML: reiniciar loop" neste ciclo.
+                            restart_signal: list[bool | int | None] = [False, action.loop_restart_group]
                             current_round = completed_rounds + 1
                             self.events.put(("status", f"{action.label or 'Loop XML'}: ciclo {current_round}/{rounds}."))
                             # A validação de reinício encerra o ramo antes do
@@ -15668,6 +19006,7 @@ class MacroApp(tk.Tk):
                         cycle = 0
                         found_once = False
                         missing_xml_attempts = 0
+                        unavailable_cycles = 0
                         while time.monotonic() < end_at and not self.run_stop_event.is_set():
                             cycle += 1
                             # A verificação é silenciosa; o resultado encontrado é registrado abaixo.
@@ -15728,6 +19067,7 @@ class MacroApp(tk.Tk):
                             if self.run_stop_event.is_set():
                                 break
                             if xml_unavailable:
+                                unavailable_cycles += 1
                                 variation = max(0, action.nav_position_variation_px)
                                 start_dx, start_dy = random.randint(-variation, variation), random.randint(-variation, variation)
                                 end_dx, end_dy = random.randint(-variation, variation), random.randint(-variation, variation)
@@ -15738,7 +19078,13 @@ class MacroApp(tk.Tk):
                                 ey = max(0, min(target_screen[1] - 1, (recorded_swipe.y2 if recorded_swipe.y2 is not None else recorded_swipe.y) + end_dy))
                                 self.events.put(("status", f"Nav-S: ciclo {cycle} — XML indisponível após 3 tentativas; executando somente o arrasto."))
                                 adb.command("shell", "input", "swipe", str(sx), str(sy), str(ex), str(ey), str(max(1, recorded_swipe.duration_ms)))
+                                fallback = next((item for item in configured if item.kind == "xml_list" and item.enabled), None)
+                                if unavailable_cycles >= 2 and fallback is not None:
+                                    self.events.put(("status", "Nav-S: XML continua indisponível após o arrasto; executando a rota da Lista de XMLs e encerrando Nav-S."))
+                                    run_branch(fallback.branch_actions, f"Nav-S > {fallback.label or 'Lista de XMLs'}", tree_group_index=action.flow_group)
+                                    break
                                 continue
+                            unavailable_cycles = 0
                             if not found_action:
                                 missing_xml_attempts += 1
                                 # A primeira verificação já aconteceu. Faça mais
@@ -15750,6 +19096,16 @@ class MacroApp(tk.Tk):
                                     if remaining <= 0 or self.run_stop_event.wait(min(remaining, random.randint(action.nav_pause_min_ms, action.nav_pause_max_ms) / 1000)):
                                         break
                                     continue
+                                fallback = next((item for item in configured if item.kind == "xml_list" and item.enabled), None)
+                                if fallback is not None:
+                                    current_xml = adb.try_ui_xml()
+                                    valid, matched_count = xml_list_is_valid(current_xml, fallback)
+                                    if valid:
+                                        self.events.put(("status", f"Nav-S: validações normais ausentes; Lista de XMLs validou {matched_count} item(ns). Executando grupo e encerrando Nav-S."))
+                                        run_branch(fallback.branch_actions, f"Nav-S > {fallback.label or 'Lista de XMLs'}", tree_group_index=action.flow_group)
+                                        found_action = True
+                                        break
+                                    self.events.put(("status", "Nav-S: validações normais ausentes; Lista de XMLs não atingiu o critério."))
                                 self.events.put(("status", f"Nav-S: nenhum dos {len(xml_validations)} XML foi encontrado após a verificação inicial e 3 novas tentativas; seguindo o fluxo normal."))
                                 break
                             remaining = end_at - time.monotonic()
@@ -15788,6 +19144,15 @@ class MacroApp(tk.Tk):
                         speed_factor = 1 if next_action and next_action.kind in ("tap", "xml_tap") else random.uniform(1 - action_speed_v, 1 + action_speed_v)
                         duration = max(260, round(action.duration_ms * speed_factor))
                         adb.command("shell", "input", "swipe", str(x), str(y), str(x2), str(y2), str(duration))
+                    elif action.kind == "subgroup":
+                        # Shift+duplo clique em um subgrupo deve reproduzir
+                        # somente seus filhos. Antes ele caía no caso genérico
+                        # abaixo e o Nav-R-C que estivesse ali nunca chegava a
+                        # ser chamado.
+                        self.events.put(("status", f"Executando subgrupo ‘{action.label or 'sem nome'}’ isoladamente."))
+                        if not run_branch(action.nested_actions or [], action.label or "Subgrupo",
+                                          tree_group_index=action.flow_group):
+                            break
                     else:
                         self.events.put(("status", f"Etapa especial ‘{action.kind}’ não é executável isoladamente; ignorando-a."))
                     with progress_lock:
@@ -15799,7 +19164,7 @@ class MacroApp(tk.Tk):
                 # Encerrar ADB durante um Esc devolve código de erro ao
                 # processo que estava em curso. Isso é cancelamento esperado,
                 # não uma falha que deva abrir popup nem exigir outro Esc.
-                if not panel_run.stop_event.is_set():
+                if not self.run_stop_event.is_set():
                     self.events.put(("error", str(error)))
             finally:
                 code_capture_stop.set()
@@ -15811,7 +19176,11 @@ class MacroApp(tk.Tk):
                 # o telefone seguir conectado; ela é restaurada em on_close.
                 with progress_lock:
                     shared["remaining"] -= 1
-                    finished = shared["remaining"] == 0
+                with panel_run.worker_lock:
+                    panel_run.active_workers = max(0, panel_run.active_workers - 1)
+                    panel_run.active_serials.discard(str(target["serial"]))
+                    panel_run.device_stop_events.pop(str(target["serial"]), None)
+                    finished = panel_run.active_workers == 0
                 if finished:
                     message = "Execução interrompida." if self.run_stop_event.is_set() else f"Execução concluída em {len(jobs)} telefone(s)/painel(is)."
                     self.events.put(("status", message))
@@ -15844,7 +19213,7 @@ class MacroApp(tk.Tk):
                             end_at = time.monotonic() + action.timeout_s
                             position = None
                             while time.monotonic() < end_at and not self.run_stop_event.is_set():
-                                position = self._xml_bounds(self.adb.ui_xml(), action)
+                                position = self._xml_bounds(self.adb.capture_ui_xml(), action)
                                 if position: break
                                 self.run_stop_event.wait(0.6)
                             if not position and not self.run_stop_event.is_set():
@@ -16132,6 +19501,12 @@ class MacroApp(tk.Tk):
         # pessoa deixou abertos para editar. Isso era especialmente incômodo
         # depois de apagar uma etapa interna.
         open_items: set[str] = set()
+        # O Delete conserva a abertura pela identidade dos objetos, porque
+        # ids visuais baseados em Ã­ndice deixam de valer assim que uma linha
+        # anterior Ã© removida. Nas demais atualizaÃ§Ãµes, a rota leve por id
+        # continua suficiente.
+        preserve_open_by_object = bool(getattr(self, "_tree_preserve_open_by_object_once", False))
+        self._tree_preserve_open_by_object_once = False
         # refresh_tree recria as linhas; mantenha a posicao da lista durante
         # edicoes em subgrupos que estao longe do topo.
         tree_scroll_y = 0.0
@@ -16140,13 +19515,15 @@ class MacroApp(tk.Tk):
                 tree_scroll_y = float(self.tree.yview()[0])
             except (tk.TclError, IndexError, TypeError):
                 tree_scroll_y = 0.0
-            def remember_open(parent: str = "") -> None:
-                for item in self.tree.get_children(parent):
-                    if bool(self.tree.item(item, "open")):
-                        open_items.add(item)
-                    remember_open(item)
-            remember_open()
-        open_items.update(getattr(self, "_tree_open_after_refresh", set()))
+            if not preserve_open_by_object:
+                def remember_open(parent: str = "") -> None:
+                    for item in self.tree.get_children(parent):
+                        if bool(self.tree.item(item, "open")):
+                            open_items.add(item)
+                        remember_open(item)
+                remember_open()
+        if not preserve_open_by_object:
+            open_items.update(getattr(self, "_tree_open_after_refresh", set()))
         self._tree_open_after_refresh = set()
         self.tree.delete(*self.tree.get_children())
         groups = self.macros[self.flow_var.get()]
@@ -16171,7 +19548,7 @@ class MacroApp(tk.Tk):
                 actions[nested_index] = nested
                 nested_id = f"{prefix}:{group_index}:" + ":".join(str(value) for value in [*path, nested_index])
                 labels = {"tap": "Toque", "swipe": "Arrasto", "xml_tap": f"XML: {nested.selector_type or 'search'}",
-                          "xml_logic": "XML condicional", "subgroup": "Subgrupo", "navigate_r": "Nav-R",
+                          "xml_logic": "XML condicional", "xml_list": "Lista de XMLs", "subgroup": "Subgrupo", "navigate_r": "Nav-R",
                           "navigate_s": "Nav-S", "navigate_rc": "Nav-R-C", "key": "Tecla"}
                 nested_label = labels.get(nested.kind, nested.kind)
                 nested_name = nested.label or f"Etapa {nested_index + 1}"
@@ -16205,6 +19582,9 @@ class MacroApp(tk.Tk):
                     nested_values = (nested_label, nested.selector_value or "texto XML", "tocar ao encontrar", f"até {nested.timeout_s}s", f"{nested.delay_ms} ms")
                 elif nested.kind == "xml_logic":
                     nested_values = (nested_label, nested.selector_value or "texto XML", "se achar: executar grupo", f"até {nested.timeout_s}s", f"{nested.delay_ms} ms")
+                elif nested.kind == "xml_list":
+                    criterion = "todos" if nested.xml_list_mode == "all" else f"mín. {nested.xml_list_min_matches}"
+                    nested_values = (nested_label, f"{len(nested.xml_list_queries or [])} XML(s)", f"validar {criterion} e executar grupo", f"até {nested.timeout_s}s", f"{nested.delay_ms} ms")
                 elif nested.kind == "subgroup":
                     nested_values = (nested_label, f"{len(nested.nested_actions or [])} etapa(s)", "executar neste ponto", "contêiner", f"{nested.delay_ms} ms")
                 elif nested.kind == "tap":
@@ -16256,12 +19636,12 @@ class MacroApp(tk.Tk):
                                 f"{max(1, int(group.get('training_min_rounds', 1)))}–{max(1, int(group.get('training_max_rounds', 1)))} vez(es)", "")
             elif group.get("validation_loop"):
                 group_values = ("loop + XML", str(group.get("validation_loop_query") or "texto XML"), "repetir se encontrar",
-                                f"até {float(group.get('validation_loop_timeout_s', 3)):g}s", "")
+                                f"até {float(group.get('validation_loop_timeout_s', 10)):g}s", "")
             elif group.get("xml_restart_loop_group"):
                 group_values = ("loop + XML", "validações internas", "reiniciar se encontrar",
                                 f"{max(1, int(group.get('xml_restart_loop_min_rounds', 1)))}–{max(1, int(group.get('xml_restart_loop_max_rounds', 1)))} ciclo(s)", "")
             elif group.get("xml_any_tap_group"):
-                group_values = (f"{len(group['actions'])} XML(s)", "primeiro encontrado", "tocar", "até 3 tentativas", "")
+                group_values = (f"{len(group['actions'])} XML(s)", "primeiro encontrado", "tocar", "até 10 s", "")
             elif group.get("navigation_s"):
                 group_values = ("Nav-S", "início do grupo", "verificar XML", "—",
                                 f"{max(0, int(group.get('nav_start_delay_ms', 0)))} ms")
@@ -16272,8 +19652,8 @@ class MacroApp(tk.Tk):
                              tags=("group",) if group_enabled else ("group", "disabled"))
             for action_index, a in enumerate(group["actions"]):
                 labels = {"tap": "Toque", "swipe": "Arrasto", "nav_rc_scroll": "Nav-R-C: arrasto de busca", "key": (a.keycode or "Tecla").replace("KEYCODE_", "Tecla: "),
-                          "xml_tap": f"XML: {a.selector_type}", "xml_group_gate": "XML: continuar grupo", "xml_restart_loop": "XML: reiniciar loop", "xml_logic": "XML condicional", "xml_any_tap": "XML: clicar qualquer", "navigate_r": "Nav-R", "training_nav_r": "Nav-R", "subgroup": "Subgrupo", "navigate_s": "Nav-S", "navigate_rc": "Nav-R-C", "nav_rc_extract": "Nav-R-C: extrair", "nav_rc_type": "Nav-R-C: digitar", "install_apk": "Instalar APK", "launch_app": "Abrir app", "instagram_ready": "Instagram pronto",
-                          "generated_email": "E-mail", "generated_password": "Senha", "generated_full_name": "Nome", "random_name": "Nome aleatório", "add_waiting_identity": "Aguardando", "training_random_username": "Usuário aleatório treino", "random_user_files": "Enviar mídias", "normal_account_media": "Enviar mídia normal", "clear_downloads": "Limpar Imagens", "random_user_link": "Link do nome", "random_link_title": "Título do link", "random_caption": "Legenda aleatória", "random_hashtags": "Hashtags aleatórias", "media_process": "Processar mídias", "pc_automation": "Automação PC", "pc_copy_link_to_phone": "PC: copiar link", "generated_username": "Usuário", "clear_text": "Limpar texto", "enter": "Enter / nova linha", "unlock_screen": "Ligar e desbloquear tela", "keep_screen_on": "Manter tela ligada", "screen_off": "Desligar tela", "volume_max": "Volume máximo", "volume_min": "Volume mínimo", "configure_proxy": "Configurar proxy", "disable_proxy": "Desativar proxy", "adb_command": "ADB", "instagram_code": "Código", "smspool_order": "SMSPool número", "smspool_code": "SMSPool código", "whisper_capture": "Whisper capturar", "whisper_type": "Whisper digitar", "birthdate": "Data nasc.", "schedule_divider": "Divisão de horários"}
+                          "xml_tap": f"XML: {a.selector_type}", "xml_group_gate": "XML: continuar grupo", "xml_restart_loop": "XML: reiniciar loop", "xml_logic": "XML condicional", "xml_any_tap": "XML: clicar qualquer", "xml_list": "Lista de XMLs", "navigate_r": "Nav-R", "training_nav_r": "Nav-R", "subgroup": "Subgrupo", "navigate_s": "Nav-S", "navigate_rc": "Nav-R-C", "nav_rc_extract": "Nav-R-C: extrair", "nav_rc_type": "Nav-R-C: digitar", "install_apk": "Instalar APK", "launch_app": "Abrir app", "instagram_ready": "Instagram pronto",
+                          "generated_email": "E-mail", "generated_password": "Senha", "generated_full_name": "Nome", "random_name": "Nome aleatório", "add_waiting_identity": "Aguardando", "training_random_username": "Usuário aleatório treino", "random_user_files": "Enviar mídias", "normal_account_media": "Enviar mídia normal", "clear_downloads": "Limpar Imagens", "random_user_link": "Link aleatório", "browser_invite": "Enviar convite", "random_link_title": "Título do link", "random_caption": "Legenda aleatória", "random_hashtags": "Hashtags aleatórias", "media_process": "Processar mídias", "pc_automation": "Automação PC", "pc_copy_link_to_phone": "PC: copiar link", "generated_username": "Usuário", "clear_text": "Limpar texto", "enter": "Enter / nova linha", "unlock_screen": "Ligar e desbloquear tela", "keep_screen_on": "Manter tela ligada", "screen_off": "Desligar tela", "volume_max": "Volume máximo", "volume_min": "Volume mínimo", "configure_proxy": "Configurar proxy", "disable_proxy": "Desativar proxy", "adb_command": "ADB", "instagram_code": "Código", "smspool_order": "SMSPool número", "smspool_code": "SMSPool código", "whisper_capture": "Whisper capturar", "whisper_type": "Whisper digitar", "birthdate": "Data nasc.", "schedule_divider": "Divisão de horários"}
                 label = labels.get(a.kind, a.kind)
                 if a.kind == "subgroup":
                     start, end, duration = f"{len(a.nested_actions or [])} etapa(s)", "executar neste ponto", "contêiner"
@@ -16296,7 +19676,13 @@ class MacroApp(tk.Tk):
                 elif a.kind == "training_random_username":
                     start, end, duration = "usuarioAleatorioTreino", "sortear e digitar", "--"
                 elif a.kind == "random_user_files":
-                    if a.character_media_folder is not None:
+                    if a.identity_media_type:
+                        media_labels = {"perfil": "Perfil", "story": "Story", "verificacao": "Verificação"}
+                        start, end, duration = (
+                            media_labels.get(a.identity_media_type, a.identity_media_type),
+                            "sortear, processar e enviar da identidade", "--",
+                        )
+                    elif a.character_media_folder is not None:
                         start, end, duration = (
                             a.character_media_folder or "raiz do personagem",
                             "sortear, processar e enviar", "--",
@@ -16310,7 +19696,9 @@ class MacroApp(tk.Tk):
                 elif a.kind == "clear_downloads":
                     start, end, duration = "Imagens iggen", "limpar mídias", "--"
                 elif a.kind == "random_user_link":
-                    start, end, duration = "link do usuário", "digitar no campo", "--"
+                    start, end, duration = "link geral aleatório", "digitar no campo", "--"
+                elif a.kind == "browser_invite":
+                    start, end, duration = "@ atual", "convidar como testador", "navegador isolado"
                 elif a.kind == "random_link_title":
                     start, end, duration = "lista de títulos", "sortear e digitar", "--"
                 elif a.kind == "random_caption":
@@ -16389,6 +19777,9 @@ class MacroApp(tk.Tk):
                     candidates = [item for item in (a.branch_actions or [])
                                   if (item if isinstance(item, Action) else Action(**item)).kind == "xml_tap"]
                     start, end, duration = f"{len(candidates)} XML(s)", "primeiro encontrado", f"até {a.xml_any_max_rounds} repetição(ões)"
+                elif a.kind == "xml_list":
+                    criterion = "todos" if a.xml_list_mode == "all" else f"mín. {a.xml_list_min_matches}"
+                    start, end, duration = f"{len(a.xml_list_queries or [])} XML(s)", f"validar {criterion} e executar grupo", f"até {a.timeout_s}s"
                 elif a.kind == "navigate_r":
                     start, end, duration = "arrasto + 2 toques", f"{a.nav_min_rounds}–{a.nav_max_rounds} rodada(s)", f"{a.nav_min_s:g}–{a.nav_max_s:g}s cada"
                 elif a.kind == "navigate_s":
@@ -16430,7 +19821,7 @@ class MacroApp(tk.Tk):
                 self.tree.insert(group_id, "end", iid=action_id,
                                  text=action_name if enabled else "[desativada] " + action_name,
                                  values=action_values,
-                                 tags=(("container",) if a.kind in ("subgroup", "xml_logic", "xml_any_tap", "navigate_r", "navigate_s", "navigate_rc") else ()) + (("schedule_divider",) if a.kind == "schedule_divider" else ()) + (() if enabled else ("disabled",)),
+                                 tags=(("container",) if a.kind in ("subgroup", "xml_logic", "xml_any_tap", "xml_list", "navigate_r", "navigate_s", "navigate_rc") else ()) + (("schedule_divider",) if a.kind == "schedule_divider" else ()) + (() if enabled else ("disabled",)),
                                  open=action_id in open_items)
                 if False and a.kind in ("subgroup", "xml_logic", "navigate_r", "navigate_s", "navigate_rc"):
                     children = (a.nested_actions if a.kind == "subgroup" else
@@ -16479,6 +19870,14 @@ class MacroApp(tk.Tk):
             self.tree.yview_moveto(tree_scroll_y)
         except tk.TclError:
             pass
+        def restore_tree_scroll(position=tree_scroll_y) -> None:
+            try:
+                if self.tree.winfo_exists():
+                    self.tree.yview_moveto(position)
+            except tk.TclError:
+                pass
+        self.after_idle(restore_tree_scroll)
+        self.after(55, restore_tree_scroll)
         self._render_execution_state()
         self._filter_tree_steps()
 
@@ -16716,6 +20115,17 @@ class MacroApp(tk.Tk):
             self.tree.focus(items[0])
         return "break"
 
+    def focus_tree_boundary(self, boundary: str):
+        """Seleciona e mostra a primeira ou Ãºltima etapa/grupo da Ã¡rvore."""
+        items = self._tree_items()
+        if not items:
+            return "break"
+        target = items[0] if boundary == "start" else items[-1]
+        self.tree.selection_set(target)
+        self.tree.focus(target)
+        self.tree.see(target)
+        return "break"
+
     def select_tree_boundary(self, boundary: str):
         items = self._tree_items()
         if not items: return "break"
@@ -16891,7 +20301,7 @@ class MacroApp(tk.Tk):
                         "navigate_s", label=str(group_copy.get("name", "Nav-S")),
                         enabled=bool(group_copy.get("enabled", True)), delay_ms=max(0, int(group_copy.get("nav_start_delay_ms", 0))),
                         nav_actions=nested,
-                        nav_s_verify_timeout_s=float(group_copy.get("nav_s_verify_timeout_s", 3)),
+                        nav_s_verify_timeout_s=float(group_copy.get("nav_s_verify_timeout_s", 10)),
                         nav_min_s=float(group_copy.get("nav_min_s", 12)), nav_max_s=float(group_copy.get("nav_max_s", 20)),
                         nav_pause_min_ms=int(group_copy.get("nav_pause_min_ms", 350)), nav_pause_max_ms=int(group_copy.get("nav_pause_max_ms", 750)),
                         nav_tap_interval_min_ms=int(group_copy.get("nav_tap_interval_min_ms", 120)),
@@ -16932,6 +20342,48 @@ class MacroApp(tk.Tk):
         items = self.tree.selection()
         if not items:
             return
+        groups_before_delete = self.macros[self.flow_var.get()]
+        # IDs como ``a:3:5`` dependem do Ã­ndice. Depois de apagar uma etapa
+        # ou grupo anterior, esse Ã­ndice muda e a restauraÃ§Ã£o normal fechava
+        # tudo. Guardamos a identidade dos contÃªineres, que permanece igual
+        # para qualquer grupo/etapa que nÃ£o foi removido.
+        open_group_objects: set[int] = set()
+        open_action_objects: set[int] = set()
+        try:
+            def remember_open_containers(parent: str = "") -> None:
+                for item in self.tree.get_children(parent):
+                    if bool(self.tree.item(item, "open")):
+                        parts = item.split(":")
+                        if parts[0] == "g":
+                            index = int(parts[1])
+                            if 0 <= index < len(groups_before_delete):
+                                open_group_objects.add(id(groups_before_delete[index]))
+                        else:
+                            location = self._tree_action_container(item)
+                            if location is not None:
+                                _group, actions, index = location
+                                if 0 <= index < len(actions):
+                                    open_action_objects.add(id(actions[index]))
+                    remember_open_containers(item)
+            remember_open_containers()
+        except (IndexError, TypeError, ValueError, tk.TclError):
+            # A exclusÃ£o nunca deve deixar de funcionar se uma linha estiver
+            # sendo reconstruÃ­da pela interface no mesmo instante.
+            open_group_objects.clear()
+            open_action_objects.clear()
+        # A reconstruÃ§Ã£o da Ã¡rvore depois do Delete nÃ£o pode jogar a pessoa
+        # para o topo. Guardamos as duas listas possÃ­veis: a principal e a
+        # compacta do cartÃ£o que estÃ¡ sendo manipulado.
+        try:
+            main_scroll_before_delete = float(self.tree.yview()[0])
+        except (tk.TclError, IndexError, TypeError):
+            main_scroll_before_delete = 0.0
+        compact_tree = self.device_grid_flow_trees.get(str(self.grid_edit_serial or ""))
+        try:
+            compact_scroll_before_delete = (float(compact_tree.yview()[0])
+                                            if compact_tree and compact_tree.winfo_exists() else None)
+        except (tk.TclError, IndexError, TypeError):
+            compact_scroll_before_delete = None
         groups_to_delete: set[int] = set()
         root_actions_to_delete: dict[int, set[int]] = {}
         # Cada item interno aponta para sua lista real de irmãos. Isso permite
@@ -16985,7 +20437,32 @@ class MacroApp(tk.Tk):
         for group_index in sorted(groups_to_delete, reverse=True):
             if group_index < len(groups): groups.pop(group_index)
         self.active_group = min(self.active_group or 0, len(groups) - 1) if groups else None
+        # NÃ£o deixe refresh_tree reaplicar o estado antigo por ids que foram
+        # deslocados pelo Delete; logo abaixo restauramos pelos objetos que
+        # realmente permaneceram na macro.
+        self._tree_preserve_open_by_object_once = True
         self.refresh_tree()
+        # ReconstrÃ³i exatamente os contÃªineres antes abertos pelo objeto da
+        # macro, e nÃ£o pelo id visual que pode ter sido deslocado pelo Delete.
+        try:
+            def restore_open_containers(parent: str = "") -> None:
+                for item in self.tree.get_children(parent):
+                    parts = item.split(":")
+                    keep_open = False
+                    if parts[0] == "g":
+                        index = int(parts[1])
+                        keep_open = 0 <= index < len(groups) and id(groups[index]) in open_group_objects
+                    else:
+                        location = self._tree_action_container(item)
+                        if location is not None:
+                            _group, actions, index = location
+                            keep_open = 0 <= index < len(actions) and id(actions[index]) in open_action_objects
+                    if keep_open:
+                        self.tree.item(item, open=True)
+                    restore_open_containers(item)
+            restore_open_containers()
+        except (IndexError, TypeError, ValueError, tk.TclError):
+            pass
         # Mantém o foco no ponto de edição: a próxima etapa/grupo que ocupou
         # o lugar removido; se não houver, usa a anterior do mesmo contêiner.
         restore_item = ""
@@ -17000,8 +20477,28 @@ class MacroApp(tk.Tk):
             elif groups:
                 restore_item = f"g:{min(group_index, len(groups) - 1)}"
         if restore_item and self.tree.exists(restore_item):
-            self.tree.selection_set(restore_item); self.tree.focus(restore_item); self.tree.see(restore_item)
+            # Seleciona a prÃ³xima etapa do mesmo ponto, mas nÃ£o use ``see``:
+            # ele faz o Tk reposicionar a viewport e era a origem do salto ao
+            # topo quando vÃ¡rias etapas eram apagadas de uma vez.
+            self.tree.selection_set(restore_item); self.tree.focus(restore_item)
             self.active_group = int(restore_item.split(":")[1])
+
+        def restore_scroll_position() -> None:
+            try:
+                self.tree.yview_moveto(main_scroll_before_delete)
+            except tk.TclError:
+                pass
+            try:
+                if compact_tree and compact_tree.winfo_exists() and compact_scroll_before_delete is not None:
+                    compact_tree.yview_moveto(compact_scroll_before_delete)
+            except tk.TclError:
+                pass
+
+        # A lista compacta agenda a prÃ³pria recarga apÃ³s o atalho. Reaplicamos
+        # apÃ³s a fila do Tk e uma vez quando ela estabilizou, cobrindo Fluxo e
+        # Celulares sem depender da ordem dos eventos.
+        self.after_idle(restore_scroll_position)
+        self.after(70, restore_scroll_position)
         self.save_macro()
         removed = sum(len(indexes) for indexes in root_actions_to_delete.values()) + sum(
             len(entry[2]) for entry in nested_actions_to_delete.values()
@@ -17207,6 +20704,10 @@ class MacroApp(tk.Tk):
                         except (TypeError, ValueError, IndexError):
                             pass
                     continue
+                if kind == "warm_scrcpy_process":
+                    serial, process, error = data
+                    self._warm_scrcpy_process_started(str(serial), process, error)
+                    continue
                 if kind == "live_xml_bounds":
                     serial, bounds, source_size = data
                     # A tela embutida sempre representa somente o telefone
@@ -17250,9 +20751,48 @@ class MacroApp(tk.Tk):
                     self.status.set(f"Não foi possível alterar a tela do telefone {serial}.")
                     messagebox.showerror("Tela", f"O switch não foi salvo porque o telefone não aceitou a alteração:\n{error}", parent=self)
                     continue
+                if kind == "device_connection_snapshot":
+                    snapshot = tuple(data)
+                    previous = getattr(self, "device_connection_watch_signature", None)
+                    self.device_connection_watch_signature = snapshot
+                    # Na inicialização a atualização normal já está em curso.
+                    # Depois disso, qualquer diferença (incluindo offline ->
+                    # device) recompõe a grade sem as leituras pesadas de
+                    # modelo de todos os aparelhos.
+                    if previous is not None and snapshot != previous:
+                        previous_states = {str(item[0]): (str(item[1]), str(item[2]) if len(item) > 2 else "")
+                                           for item in previous}
+                        current_states = {str(item[0]): (str(item[1]), str(item[2]) if len(item) > 2 else "")
+                                          for item in snapshot}
+                        # Um scrcpy pode continuar rodando depois de o Android
+                        # sair do USB, mas já não volta a transmitir ao reconectar.
+                        # Descarte somente a reserva do serial que acabou de
+                        # voltar para que a grade crie uma sessão realmente nova.
+                        for serial, (state, transport_id) in current_states.items():
+                            old_state, old_transport_id = previous_states.get(serial, ("", ""))
+                            if (state == "device" and (old_state != "device"
+                                                       or (transport_id and old_transport_id
+                                                           and transport_id != old_transport_id))):
+                                self._dispose_disconnected_live_view(serial)
+                        self._refresh_after_connection_change()
+                    continue
                 if kind == "devices":
                     data, after_refresh = data
                     selection = {p["serial"] for p in self.selected_profiles()}
+                    # Preserve the previews that belong to serials still
+                    # connected. A disconnect must only clean up its own
+                    # scrcpy reservation, never the other phones.
+                    previously_connected = {
+                        str(profile.get("serial", ""))
+                        for profile in self.device_profiles.values()
+                        if profile.get("state") == "device"
+                    }
+                    now_connected = {
+                        str(serial) for serial, state, _model in data
+                        if state == "device"
+                    }
+                    for disconnected_serial in previously_connected - now_connected:
+                        self._dispose_disconnected_live_view(disconnected_serial)
                     # Quando a lista Ã© recriada depois de trocar de painel, a
                     # seleÃ§Ã£o visual anterior pode jÃ¡ ter sumido. Restaure a
                     # escolha persistida somente para o painel atual.
@@ -17352,6 +20892,14 @@ class MacroApp(tk.Tk):
                         if profile["state"] == "device" and profile["serial"] in selection:
                             self.device_list.selection_set(position)
                     self.device_list.configure(height=max(5, len(labels)))
+                    # A pré-carga visual é essencial para a prévia inicial;
+                    # ela não pode depender dos controles auxiliares que vêm
+                    # abaixo. Assim o scrcpy já começa enquanto os switches da
+                    # lista terminam de ser montados.
+                    ready = [profile for profile in self.device_profiles.values()
+                             if profile["state"] == "device"]
+                    self._prepare_all_device_visuals(ready)
+                    self._warm_uiautomator2_servers(ready)
                     # Um switch por linha, dentro do mesmo quadro da lista.
                     # Cada um usa o serial como chave, portanto permanece igual
                     # após atualizar ou reiniciar o aplicativo.
@@ -17374,44 +20922,53 @@ class MacroApp(tk.Tk):
                             button_hover_color="#ffffff", text_color="#dbe5f2",
                         )
                         self.device_row_switches.append(switch)
-                        screen_var = tk.BooleanVar(value=bool(self.saved_names.get(profile["serial"], {}).get("keep_screen_on", False)))
-                        screen_switch = ctk.CTkSwitch(
-                            self.device_switch_rail, text="Tela", variable=screen_var,
-                            command=lambda serial=profile["serial"], value=screen_var: self.toggle_device_screen_on(serial, value),
-                            onvalue=True, offvalue=False, width=106, height=20,
-                            fg_color="#28222f", progress_color="#7b45cf", button_color="#f8fafc",
-                            button_hover_color="#ffffff", text_color="#dbe5f2",
-                        )
-                        self.device_screen_switches.append(screen_switch)
                     self.after_idle(self._align_device_status_indicators)
                     ready = [profile for profile in self.device_profiles.values() if profile["state"] == "device"]
                     ready_groups = {profile["group"] for profile in ready}
                     if ready and len(ready_groups) == 1:
                         self.adb.serial = ready[0]["serial"]
                         self.device_model = ready[0]["group"]
-                        self.load_model_groups(self.flow_var.get(), self.device_model)
-                        self.refresh_tree()
+                        if self._ensure_model_groups_loaded(self.flow_var.get(), self.device_model):
+                            self.refresh_tree()
                     # Só tenta uma vez por abertura. Caso não exista telefone
                     # autorizado, os botões continuam disponíveis para iniciar
                     # assim que ele for conectado.
                     if (ready and not self.live_view_autostart_attempted
                             and (not getattr(self, "app_view_var", None) or self.app_view_var.get() == "fluxo")):
                         self.live_view_autostart_attempted = True
-                        live_selected = next((item for item in self.selected_profiles()
-                                              if item.get("state") == "device"), ready[0])
-                        self.after(250, lambda serial=live_selected["serial"]: self.start_live_view(serial))
                     if restored_panel_selection:
                         # A seleÃ§Ã£o restaurada tambÃ©m precisa atualizar campos,
                         # macro e tela ao vivo, como se a pessoa tivesse clicado.
                         self.after_idle(self._restore_last_selected_device_for_panel)
                     self.status.set("Telefones conectados atualizados. Selecione os que deseja executar.")
+                    # A grade tambÃ©m Ã© preparada enquanto o Fluxo estÃ¡ aberto.
+                    # Dessa forma, a primeira ida para Celulares encontra os
+                    # cartÃµes e seus hosts jÃ¡ prontos, em vez de montÃ¡-los na
+                    # frente da pessoa. Em Celulares a atualizaÃ§Ã£o continua
+                    # imediata para refletir conexÃµes/desconexÃµes.
                     if getattr(self, "app_view_var", None) and self.app_view_var.get() == "celulares":
-                        self._refresh_device_grid()
+                        self._refresh_device_grid(preserve_live_views=True)
+                    else:
+                        self._schedule_device_grid_preload()
                     if after_refresh:
                         # Executa no próprio ciclo que recebeu o resultado ADB.
                         # Assim iniciar não depende de outro evento do Windows,
                         # como teclado ou movimento do mouse.
                         after_refresh()
+                elif kind == "uiautomator2_server":
+                    serial, error_text = data
+                    if self.uiautomator2_starting_serial == serial:
+                        self.uiautomator2_starting_serial = ""
+                    if error_text:
+                        # Não interrompe a interface: uma futura atualização ou
+                        # a própria captura pode tentar o servidor novamente.
+                        self._append_execution_log(
+                            f"uiautomator2: não foi possível preparar {serial}: {error_text}",
+                            self.flow_var.get(), serial,
+                        )
+                    else:
+                        self.uiautomator2_ready_serials.add(str(serial))
+                    self._start_next_uiautomator2_server()
                 elif kind == "screen":
                     serial, self.screen, raw = data
                     self.device_calibrations[serial] = (self.screen, raw)
@@ -17470,15 +21027,35 @@ class MacroApp(tk.Tk):
                         continue
                     if event_panel in (None, self.flow_var.get()):
                         serial = self._execution_state_serial()
-                        self._pending_running_items[serial] = self.tree_item_for_action(data) if data is not None else None
+                        self._pending_running_items[serial] = (
+                            self.tree_item_for_action(data) if data is not None else None,
+                            event_panel,
+                        )
                 elif kind == "running_item":
                     if event_panel and event_panel not in self.panel_runs:
                         continue
-                    serial, item = data if isinstance(data, tuple) else (None, data)
+                    if isinstance(data, tuple):
+                        serial, item, *run_ids = data
+                    else:
+                        serial, item, run_ids = None, data, []
+                    run_id = str(run_ids[0]) if run_ids else ""
+                    active_run = self.panel_runs.get(str(event_panel or "")) if event_panel else None
+                    if run_id and (active_run is None or active_run.run_id != run_id):
+                        continue
                     # A grade exibe telefones de painéis/modelos diferentes ao
                     # mesmo tempo. Não descarte a etapa do outro cartão só
                     # porque o editor principal está em um painel distinto.
-                    self._pending_running_items[str(serial or self._execution_state_serial())] = item
+                    self._pending_running_items[str(serial or self._execution_state_serial())] = (item, event_panel)
+                elif kind == "device_connection_paused":
+                    serial = str(data)
+                    state = self.device_execution_states.setdefault(serial, {"running": None})
+                    state["paused"] = True
+                    self._refresh_device_grid_title(serial)
+                elif kind == "device_connection_resumed":
+                    serial = str(data)
+                    state = self.device_execution_states.setdefault(serial, {"running": None})
+                    state["paused"] = False
+                    self._refresh_device_grid_title(serial)
                 elif kind == "execution_device_finished":
                     self._pending_running_items.pop(str(data), None)
                     state = self.device_execution_states.get(str(data))
@@ -17486,6 +21063,7 @@ class MacroApp(tk.Tk):
                         self._collapse_finished_grid_containers(str(data), state.get("running"))
                         self._collapse_finished_main_containers(state.get("running"))
                         state["running"] = None
+                        state["paused"] = False
                     self._render_grid_running_step(str(data), None)
                     if not getattr(self, "app_view_var", None) or self.app_view_var.get() != "celulares":
                         self._render_execution_state()
@@ -17570,7 +21148,12 @@ class MacroApp(tk.Tk):
             # pontual ao desenhar uma prévia, trocar painel ou atualizar uma
             # linha não pode cancelar o próximo `after` e fazer log/destaque
             # só voltarem depois de um clique do usuário.
-            pass
+            try:
+                (RUNTIME_DIR / "ui_event_error.log").write_text(
+                    traceback.format_exc(), encoding="utf-8"
+                )
+            except OSError:
+                pass
         # A árvore e o log são aplicados no próximo momento livre do Tk. Isso
         # evita que uma sequência intensa de verificações XML monopolize a UI.
         self._request_execution_ui_commit()

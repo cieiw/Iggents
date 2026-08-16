@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 
 from tools.audio_capture import capture_device_audio
 from tools.link_title_generator import load_link_titles, random_link_title, save_link_titles
-from tools.name_email_generator import random_first_name, random_name_profile, random_training_username, random_user
+from tools.name_email_generator import (random_first_name, random_fixed_identity_media, random_identity_media, random_identity_media_folder,
+                                        random_name_profile, random_training_username, random_user, validate_last_names)
 from tools.runtime_variables import RuntimeVariables
 from tools.zoho_code_reader import _message_addresses
 from tools.whisper_engine import extract_verification_code
@@ -115,17 +116,31 @@ class WhisperCodeTests(unittest.TestCase):
         self.assertTrue(MacroApp._xml_has_blocked_text("Story sugestões", "Patrocinado, Sugestões"))
         self.assertFalse(MacroApp._xml_has_blocked_text("Story normal", "Patrocinado, Sugestões"))
 
-    def test_xml_capture_recovers_after_uiautomator_is_killed(self) -> None:
+    def test_xml_capture_uses_uiautomator2(self) -> None:
         adb = Adb()
-        adb.command = Mock(side_effect=[
-            RuntimeError("ADB falhou: Killed"),  # primeira captura
-            "",                                  # segunda tentativa sem XML
-            "",                                # limpeza do processo preso
-            '<hierarchy><node bounds="[0,0][1,1]" /></hierarchy>',  # dump direto após limpar
-        ])
-        with patch("app.time.sleep"):
-            self.assertIn("hierarchy", adb.ui_xml(timeout=2))
-        self.assertEqual(adb.command.call_count, 4)
+        adb.uiautomator2_xml = Mock(return_value='<hierarchy><node bounds="[0,0][1,1]" /></hierarchy>')
+        self.assertIn("hierarchy", adb.capture_ui_xml(timeout=2))
+        self.assertEqual(adb.uiautomator2_xml.call_count, 1)
+
+    def test_identity_media_is_read_from_the_assigned_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = root / "identidade1"
+            for media_type in ("perfil", "verificacao"):
+                folder = identity / media_type
+                folder.mkdir(parents=True)
+                (folder / f"{media_type}.jpg").write_bytes(b"media")
+            story = root / "story"
+            story.mkdir()
+            (story / "story.jpg").write_bytes(b"media")
+            self.assertEqual(random_identity_media_folder(root), identity)
+            self.assertEqual(random_identity_media(identity, "perfil"), identity / "perfil" / "perfil.jpg")
+            self.assertEqual(random_fixed_identity_media(root, "story"), story / "story.jpg")
+
+    def test_identity_last_names_reject_matching_three_letter_prefixes(self) -> None:
+        self.assertEqual(validate_last_names(["Silva", "Santos"]), ["Silva", "Santos"])
+        with self.assertRaisesRegex(ValueError, "Silva"):
+            validate_last_names(["Silva", "Silveira"])
 
     def test_nav_r_xml_queries_keep_each_non_empty_line_when_saved(self) -> None:
         edited = "Sugestões\nAnúncio\nPatrocinado\n sugestões \n\n"
