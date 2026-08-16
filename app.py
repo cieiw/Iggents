@@ -76,7 +76,7 @@ IDENTITIES_DIR.mkdir(parents=True, exist_ok=True)
 BROWSER_PROFILES_DIR = DATA_DIR / "browser_profiles"
 INVITE_BROWSER_PROFILE = BROWSER_PROFILES_DIR / "enviar_convite"
 INVITE_BROWSER_PORT = 9326
-INVITE_URL = "https://developers.facebook.com/apps/1730475298100839/roles/roles/"
+INVITE_URL = "https://developers.facebook.com/apps/1050681454555978/roles/roles/"
 INVITE_SELECTOR_CAPTURES_FILE = DATA_DIR / "browser_selector_captures.json"
 # Duração de cada tentativa individual. Não há mais limite total: enquanto o
 # fluxo estiver ativo, os elementos do convite continuam sendo procurados.
@@ -11147,7 +11147,7 @@ class MacroApp(tk.Tk):
                     with sync_playwright() as playwright:
                         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{INVITE_BROWSER_PORT}")
                         context = browser.contexts[0]
-                        page = next((item for item in context.pages if "developers.facebook.com/apps/1730475298100839/roles/roles" in item.url), None)
+                        page = next((item for item in context.pages if "developers.facebook.com/apps/1050681454555978/roles/roles" in item.url), None)
                         if page is None:
                             raise RuntimeError("A aba do convite Meta não está aberta no navegador isolado.")
                         # Traz a aba certa à frente antes de armar a captura:
@@ -11231,7 +11231,7 @@ class MacroApp(tk.Tk):
                     with sync_playwright() as playwright:
                         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{INVITE_BROWSER_PORT}")
                         context = browser.contexts[0]
-                        page = next((item for item in context.pages if "developers.facebook.com/apps/1730475298100839/roles/roles" in item.url), None)
+                        page = next((item for item in context.pages if "developers.facebook.com/apps/1050681454555978/roles/roles" in item.url), None)
                         if page is None:
                             raise RuntimeError("A aba do convite Meta não está aberta no navegador isolado.")
                         page.bring_to_front()
@@ -11311,7 +11311,7 @@ class MacroApp(tk.Tk):
             context = browser.contexts[0]
             # Reaproveita a aba já aberta do app; só cria uma se ela não existir.
             page = next((item for item in context.pages
-                         if "developers.facebook.com/apps/1730475298100839/roles/roles" in item.url), None)
+                         if "developers.facebook.com/apps/1050681454555978/roles/roles" in item.url), None)
             if page is None:
                 page = context.new_page()
                 # Só navega na primeira abertura. Nas execuções seguintes a
